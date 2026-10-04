@@ -192,6 +192,166 @@ fn write_plist_string(info_plist: &std::path::Path, key: &str, value: &str) -> R
     }
 }
 
+/// The `user.reg` text with these DLLs set to load the game's own copy first,
+/// or `None` when it already does.
+///
+/// A BepInEx doorstop (`winhttp.dll`) and the other loader proxies only run
+/// when Wine prefers the native file over its builtin. Handing that over as
+/// `WINEDLLOVERRIDES` to a wrapper launch reaches Steam at best, not the game
+/// Steam later starts; the bottle's own registry is what every process in it
+/// reads, which is also where `winecfg` keeps it.
+fn with_native_dll_overrides(content: &str, dlls: &[String], now: u64) -> Option<String> {
+    const HEADER: &str = "[software\\\\wine\\\\dlloverrides]";
+    let newline = if content.contains("\r\n") { "\r\n" } else { "\n" };
+    let mut lines: Vec<String> = content.lines().map(str::to_string).collect();
+    let header = lines
+        .iter()
+        .position(|line| line.trim_start().to_ascii_lowercase().starts_with(HEADER));
+    let mut changed = false;
+
+    let header = match header {
+        Some(index) => index,
+        None => {
+            if lines.last().is_some_and(|line| !line.trim().is_empty()) {
+                lines.push(String::new());
+            }
+            lines.push(format!("[Software\\\\Wine\\\\DllOverrides] {now}"));
+            changed = true;
+            lines.len() - 1
+        }
+    };
+    let section_end = lines[header + 1..]
+        .iter()
+        .position(|line| line.trim_start().starts_with('['))
+        .map(|offset| header + 1 + offset)
+        .unwrap_or(lines.len());
+
+    let mut insert_at = header + 1;
+    while insert_at < section_end && lines[insert_at].trim_start().starts_with('#') {
+        insert_at += 1;
+    }
+    let mut section_end = section_end;
+    for dll in dlls {
+        let key = format!("\"{}\"=", dll.to_ascii_lowercase());
+        let wanted = format!("\"{}\"=\"native,builtin\"", dll);
+        match (header + 1..section_end)
+            .find(|&index| lines[index].trim_start().to_ascii_lowercase().starts_with(&key))
+        {
+            Some(index) => {
+                let value = lines[index].split_once('=').map(|(_, value)| value).unwrap_or("");
+                if !value.trim().trim_matches('"').starts_with("native") {
+                    lines[index] = wanted;
+                    changed = true;
+                }
+            }
+            None => {
+                lines.insert(insert_at, wanted);
+                section_end += 1;
+                changed = true;
+            }
+        }
+    }
+
+    changed.then(|| {
+        let mut text = lines.join(newline);
+        text.push_str(newline);
+        text
+    })
+}
+
+/// Make the bottle load these proxy DLLs from the game folder, through its
+/// registry. Returns whether `user.reg` was changed. The first change keeps a
+/// copy of the original beside it.
+pub(crate) fn ensure_native_dll_overrides(
+    prefix_root: &std::path::Path,
+    overrides: &str,
+) -> Result<bool, String> {
+    let dlls = overrides
+        .split(';')
+        .filter_map(|entry| entry.split_once('=').map(|(name, _)| name.trim().to_string()))
+        .filter(|name| !name.is_empty())
+        .collect::<Vec<_>>();
+    let user_reg = prefix_root.join("user.reg");
+    if dlls.is_empty() || !user_reg.is_file() {
+        return Ok(false);
+    }
+    let content = std::fs::read_to_string(&user_reg).map_err(|error| error.to_string())?;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs())
+        .unwrap_or_default();
+    let Some(updated) = with_native_dll_overrides(&content, &dlls, now) else {
+        return Ok(false);
+    };
+    let backup = prefix_root.join("user.reg.r2modmac-backup");
+    if !backup.exists() {
+        std::fs::copy(&user_reg, &backup).map_err(|error| error.to_string())?;
+    }
+    let staged = prefix_root.join("user.reg.r2modmac-staging");
+    std::fs::write(&staged, updated).map_err(|error| error.to_string())?;
+    std::fs::rename(&staged, &user_reg).map_err(|error| error.to_string())?;
+    log::info!(
+        "[wine] Set native DLL overrides {:?} in {}",
+        dlls,
+        user_reg.display()
+    );
+    Ok(true)
+}
+
+/// The wrapper's own launch settings, kept on disk while a launch has them
+/// replaced. Reading them back from the plist instead is what broke wrappers:
+/// a second launch inside the restore window read the first launch's values as
+/// the originals and restored those, so the wrapper kept opening the game with
+/// r2modmac's flags, or with no program at all when the read failed.
+#[derive(serde::Serialize, serde::Deserialize, Clone, Debug, PartialEq)]
+struct WrapperLaunchSettings {
+    program: String,
+    flags: String,
+}
+
+fn wrapper_settings_sidecar(info_plist: &std::path::Path) -> std::path::PathBuf {
+    info_plist.with_file_name("Info.plist.r2modmac-original.json")
+}
+
+fn original_wrapper_settings(info_plist: &std::path::Path) -> Result<WrapperLaunchSettings, String> {
+    let sidecar = wrapper_settings_sidecar(info_plist);
+    if let Some(saved) = std::fs::read(&sidecar)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<WrapperLaunchSettings>(&bytes).ok())
+        .filter(|saved| !saved.program.trim().is_empty())
+    {
+        return Ok(saved);
+    }
+    let current = WrapperLaunchSettings {
+        program: read_plist_string(info_plist, "Program Name and Path"),
+        flags: read_plist_string(info_plist, "Program Flags"),
+    };
+    if current.program.trim().is_empty() {
+        return Err(format!(
+            "Could not read the program this wrapper normally opens from {:?}; not launching, so its settings are not lost",
+            info_plist
+        ));
+    }
+    let bytes = serde_json::to_vec_pretty(&current).map_err(|error| error.to_string())?;
+    std::fs::write(&sidecar, bytes).map_err(|error| error.to_string())?;
+    Ok(current)
+}
+
+fn restore_wrapper_settings(info_plist: &std::path::Path, original: &WrapperLaunchSettings) {
+    let restored = write_plist_string(info_plist, "Program Name and Path", &original.program)
+        .and_then(|()| write_plist_string(info_plist, "Program Flags", &original.flags));
+    match restored {
+        Ok(()) => {
+            let _ = std::fs::remove_file(wrapper_settings_sidecar(info_plist));
+        }
+        Err(error) => log::warn!(
+            "[wine] Could not restore the wrapper settings in {:?}: {}. They stay saved beside it and are restored on the next launch.",
+            info_plist,
+            error
+        ),
+    }
+}
+
 pub(crate) fn launch_macos_wineskin_program(
     bundle_path: &std::path::Path,
     prefix_root: &std::path::Path,
@@ -235,8 +395,7 @@ pub(crate) fn launch_macos_wineskin_program(
         );
     }
 
-    let orig_program = read_plist_string(&info_plist, "Program Name and Path");
-    let orig_flags = read_plist_string(&info_plist, "Program Flags");
+    let original = original_wrapper_settings(&info_plist)?;
 
     // Write launch configuration.
     write_plist_string(&info_plist, "Program Name and Path", &win_path)?;
@@ -253,6 +412,13 @@ pub(crate) fn launch_macos_wineskin_program(
         .or(working_dir)
         .and_then(crate::models::loaders::wine_dll_override_value)
     {
+        if let Err(error) = ensure_native_dll_overrides(prefix_root, &overrides) {
+            log::warn!(
+                "[{}] Could not record the DLL overrides in the bottle registry: {}",
+                context,
+                error
+            );
+        }
         open_command
             .arg("--env")
             .arg(format!("WINEDLLOVERRIDES={overrides}"));
@@ -264,8 +430,7 @@ pub(crate) fn launch_macos_wineskin_program(
 
     if !open_status.success() {
         // Restore before returning error.
-        let _ = write_plist_string(&info_plist, "Program Name and Path", &orig_program);
-        let _ = write_plist_string(&info_plist, "Program Flags", &orig_flags);
+        restore_wrapper_settings(&info_plist, &original);
         return Err(format!(
             "'open -n {:?}' failed with status {}",
             bundle_path, open_status
@@ -275,16 +440,9 @@ pub(crate) fn launch_macos_wineskin_program(
     // Restore the original Info.plist values in a background thread.
     // We wait a short time to ensure the launcher has already read the plist before we restore.
     let info_plist_clone = info_plist.clone();
-    let orig_program_clone = orig_program.clone();
-    let orig_flags_clone = orig_flags.clone();
     std::thread::spawn(move || {
         std::thread::sleep(std::time::Duration::from_secs(5));
-        let _ = write_plist_string(
-            &info_plist_clone,
-            "Program Name and Path",
-            &orig_program_clone,
-        );
-        let _ = write_plist_string(&info_plist_clone, "Program Flags", &orig_flags_clone);
+        restore_wrapper_settings(&info_plist_clone, &original);
     });
 
     Ok(())
@@ -626,4 +784,102 @@ pub(crate) fn configure_macos_compat_runner_command(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod wine_registry_and_wrapper_tests {
+    use super::*;
+
+    const REG: &str = "WINE REGISTRY Version 2\n;; All keys relative to \\\\User\\\\S-1-5-21-0-0-0-1000\n\n#arch=win64\n\n[Software\\\\Wine\\\\Fonts] 1700000000\n#time=1da\n\"LogPixels\"=dword:00000060\n";
+
+    fn dlls(names: &[&str]) -> Vec<String> {
+        names.iter().map(|name| name.to_string()).collect()
+    }
+
+    #[test]
+    fn a_bottle_without_overrides_gets_the_section_and_keeps_the_rest() {
+        let updated = with_native_dll_overrides(REG, &dlls(&["winhttp"]), 42).unwrap();
+        assert!(updated.starts_with(REG.trim_end()));
+        assert!(updated.contains("[Software\\\\Wine\\\\DllOverrides] 42\n\"winhttp\"=\"native,builtin\"\n"));
+        assert!(updated.contains("\"LogPixels\"=dword:00000060"));
+        // Applying it again changes nothing.
+        assert_eq!(with_native_dll_overrides(&updated, &dlls(&["winhttp"]), 43), None);
+    }
+
+    #[test]
+    fn an_existing_builtin_override_is_turned_native_and_others_are_kept() {
+        let reg = "[Software\\\\Wine\\\\DllOverrides] 1\n#time=1\n\"d3d11\"=\"native\"\n\"WinHttp\"=\"builtin\"\n\n[Software\\\\Other] 2\n\"x\"=\"y\"\n";
+        let updated = with_native_dll_overrides(reg, &dlls(&["winhttp", "version"]), 9).unwrap();
+        assert!(updated.contains("\"winhttp\"=\"native,builtin\""));
+        assert!(!updated.contains("\"WinHttp\"=\"builtin\""));
+        assert!(updated.contains("\"d3d11\"=\"native\""));
+        // New entries go into the overrides section, not the one after it.
+        let section = updated.split("[Software\\\\Other]").next().unwrap();
+        assert!(section.contains("\"version\"=\"native,builtin\""));
+        assert!(updated.contains("[Software\\\\Other] 2\n\"x\"=\"y\""));
+        // A native-first value the user chose is left alone.
+        let native = "[Software\\\\Wine\\\\DllOverrides] 1\n\"winhttp\"=\"native\"\n";
+        assert_eq!(with_native_dll_overrides(native, &dlls(&["winhttp"]), 9), None);
+    }
+
+    #[test]
+    fn windows_line_endings_are_kept() {
+        let reg = "WINE REGISTRY Version 2\r\n\r\n[Software\\\\Wine\\\\DllOverrides] 1\r\n";
+        let updated = with_native_dll_overrides(reg, &dlls(&["winhttp"]), 9).unwrap();
+        assert!(updated.contains("[Software\\\\Wine\\\\DllOverrides] 1\r\n\"winhttp\"=\"native,builtin\"\r\n"));
+        assert!(!updated.replace("\r\n", "").contains('\n'));
+    }
+
+    #[test]
+    fn the_registry_file_is_changed_once_with_a_backup() {
+        let root = std::env::temp_dir().join(format!("r2modmac-userreg-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        assert!(!ensure_native_dll_overrides(&root, "winhttp=n,b").unwrap(), "no user.reg, nothing to do");
+        std::fs::write(root.join("user.reg"), REG).unwrap();
+        assert!(ensure_native_dll_overrides(&root, "winhttp=n,b").unwrap());
+        assert!(!ensure_native_dll_overrides(&root, "winhttp=n,b").unwrap());
+        assert_eq!(std::fs::read_to_string(root.join("user.reg.r2modmac-backup")).unwrap(), REG);
+        assert!(std::fs::read_to_string(root.join("user.reg")).unwrap().contains("\"winhttp\"=\"native,builtin\""));
+        assert!(!root.join("user.reg.r2modmac-staging").exists());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_second_launch_inside_the_restore_window_keeps_the_real_originals() {
+        let root = std::env::temp_dir().join(format!("r2modmac-wrapper-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let plist = root.join("Info.plist");
+        assert!(std::process::Command::new("/usr/bin/plutil")
+            .args(["-create", "xml1"])
+            .arg(&plist)
+            .status()
+            .unwrap()
+            .success());
+        write_plist_string(&plist, "Program Name and Path", "/Program Files (x86)/Steam/steam.exe").unwrap();
+        write_plist_string(&plist, "Program Flags", "").unwrap();
+
+        // First launch saves the originals and writes its own values.
+        let first = original_wrapper_settings(&plist).unwrap();
+        write_plist_string(&plist, "Program Flags", "-applaunch 632360").unwrap();
+        // A second launch before the restore must not take those for originals.
+        let second = original_wrapper_settings(&plist).unwrap();
+        assert_eq!(first, second);
+        assert_eq!(second.flags, "");
+
+        restore_wrapper_settings(&plist, &second);
+        assert_eq!(read_plist_string(&plist, "Program Flags"), "");
+        assert!(!wrapper_settings_sidecar(&plist).exists());
+
+        // A wrapper whose program cannot be read is not touched at all.
+        let empty = root.join("Empty.plist");
+        assert!(std::process::Command::new("/usr/bin/plutil")
+            .args(["-create", "xml1"])
+            .arg(&empty)
+            .status()
+            .unwrap()
+            .success());
+        assert!(original_wrapper_settings(&empty).is_err());
+        std::fs::remove_dir_all(root).unwrap();
+    }
 }
