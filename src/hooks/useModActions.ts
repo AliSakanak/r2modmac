@@ -9,6 +9,7 @@ import {
     satisfiesMinimumVersion,
 } from '../utils/modVersioning';
 import { inferPendingSyncKind, snapshotInstalledMod } from '../utils/profileSync';
+import { duplicatesGameBepInExPack } from '../utils/loaderPackages';
 import { runWithConcurrency } from '../utils/concurrency';
 
 const MAX_PARALLEL_OPS = 10;
@@ -147,6 +148,11 @@ export function useModActions({
             // newer installed package already satisfies it. Re-installing the pin
             // here would silently downgrade that package.
             if (profileSatisfiesPackage(profileIdToUse, dependency.packageName, dependency.version)) continue;
+            const dependencyProfile = useProfileStore.getState().profiles.find(candidate => candidate.id === profileIdToUse);
+            if (dependencyProfile?.platform !== 'mac' && duplicatesGameBepInExPack(
+                (dependencyProfile?.mods ?? []).map(mod => mod.fullName),
+                dependency.packageName,
+            )) continue;
             if (cachedPackageSatisfiesRequirement(
                 installedCache,
                 dependency.packageName,

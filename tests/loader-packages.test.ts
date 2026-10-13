@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 
 import type { InstalledMod, Profile } from '../src/types/profile.ts';
-import { isLoaderPackage, isRepairableLoaderPackage, isReturnOfModdingCommunity, loaderDisplayName, loaderPackageIds, loaderPackageIdsForCommunity } from '../src/utils/loaderPackages.ts';
+import { isLoaderPackage, isRepairableLoaderPackage, isReturnOfModdingCommunity, loaderDisplayName, loaderPackageIds, loaderPackageIdsForCommunity, isGameBepInExPack, duplicatesGameBepInExPack } from '../src/utils/loaderPackages.ts';
 import { hasPendingRuntimeInstall, requiresBepInExStorageRepair } from '../src/utils/profileSync.ts';
 
 const profileWith = (mod: InstalledMod): Profile => ({
@@ -150,4 +150,19 @@ test('the shimloader games have a loader to install, so the sidebar stops callin
 test('the lovely loader is the package Balatro actually publishes', () => {
     assert.deepEqual(loaderPackageIds('lovely'), ['Thunderstore-lovely']);
     assert.ok(isLoaderPackage('lovely', 'Thunderstore-lovely'));
+});
+
+test('a BepInExPack_<Game> fork is told from the generic pack by name', () => {
+    assert.equal(isGameBepInExPack('BepInEx-BepInExPack_PEAK-5.4.75301'), true);
+    assert.equal(isGameBepInExPack('BepInEx-BepInExPack_Skul'), true);
+    assert.equal(isGameBepInExPack('bbepis-BepInExPack'), false);
+    assert.equal(isGameBepInExPack('Author-RoR2BepInExPack'), false);
+});
+
+test('a generic BepInEx dependency is skipped beside a game fork', () => {
+    const mods = ['BepInEx-BepInExPack_Skul-5.4.1', 'Author-SomeMod-1.0.0'];
+    assert.equal(duplicatesGameBepInExPack(mods, 'bbepis-BepInExPack'), true);
+    assert.equal(duplicatesGameBepInExPack(mods, 'BepInEx-BepInExPack_Skul'), false);
+    assert.equal(duplicatesGameBepInExPack(mods, 'Author-OtherMod'), false);
+    assert.equal(duplicatesGameBepInExPack(['Author-SomeMod-1.0.0'], 'bbepis-BepInExPack'), false);
 });

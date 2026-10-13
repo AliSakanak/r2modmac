@@ -66,6 +66,26 @@ export const loaderPackageIdsForCommunity = (
 };
 
 /**
+ * Whether `fullName` is a game's own `BepInExPack_<Game>` fork rather than the
+ * generic pack. The fork carries the game's doorstop and config (PEAK's
+ * replaces winhttp.dll), and the generic pack laid over it breaks the launch.
+ * The name alone says it, so no community table has to be kept in step.
+ */
+export const isGameBepInExPack = (fullName: string): boolean => {
+    const key = packageKey(fullName);
+    return key.slice(key.indexOf('-') + 1).startsWith('bepinexpack_');
+};
+
+/** Whether installing `dependency` would put the generic BepInEx pack beside a game's fork. */
+export const duplicatesGameBepInExPack = (
+    profileModNames: readonly string[],
+    dependency: string,
+): boolean =>
+    isLoaderPackage('bepinex', dependency)
+    && !isGameBepInExPack(dependency)
+    && profileModNames.some(isGameBepInExPack);
+
+/**
  * Whether `fullName` (with or without a version suffix) is the loader itself.
  *
  * BepInEx keeps a name check alongside the schema list: communities publish

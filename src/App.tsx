@@ -43,7 +43,7 @@ import { useProfileActions } from './hooks/useProfileActions';
 import { useGameSync } from './hooks/useGameSync';
 import { compareVersions, findPinnedVersionForSource, parsePackageReference } from './utils/modVersioning';
 import { getProfileModKey, hasPendingRuntimeInstall, migratePendingSyncBaselines, requiresBepInExStorageRepair, restoreInstalledMod } from './utils/profileSync';
-import { isLoaderPackage, isRepairableLoaderPackage, isReturnOfModdingCommunity, loaderDisplayName, loaderPackageIdsForCommunity } from './utils/loaderPackages';
+import { isGameBepInExPack, isLoaderPackage, isRepairableLoaderPackage, isReturnOfModdingCommunity, loaderDisplayName, loaderPackageIdsForCommunity } from './utils/loaderPackages';
 import { isTextEntryTarget, shouldReleaseSearchFocus } from './utils/searchField';
 import { dialogStack } from './utils/dialogStack';
 import { censorText } from './utils/pathCensorUtils';
@@ -1890,6 +1890,17 @@ function App() {
             registeredSource
           )
         : null;
+      if (!registeredLoader && runtime === 'bepinex' && profile.platform !== 'mac') {
+        // A game's own BepInExPack_<Game> is published in that game's
+        // community, so the community's own listing names it. The generic pack
+        // beside it breaks the launch (PEAK). Asking the community avoids
+        // matching pack names to community slugs, which often differ. A macOS
+        // profile keeps its generic pack and the official macOS loader over it.
+        const result = await window.ipcRenderer.getPackages(community, 0, 30, 'BepInExPack', 'downloads').catch(() => null);
+        loaderPackage = result?.items.find(candidate =>
+          matchesRuntime(candidate) && isGameBepInExPack(candidate.full_name) && candidate.versions.length > 0
+        ) || null;
+      }
       if (!registeredLoader && (!loaderPackage || !matchesRuntime(loaderPackage))) {
         // The loader package differs per community - Hades II is served by
         // Hell2Modding, not by ReturnOfModding - so the candidates come from
