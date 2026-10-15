@@ -14,6 +14,7 @@ import { loaderDisplayName } from '../../utils/loaderPackages';
 import { getProfileAvatarGradient } from '../../utils/profileAvatar';
 import { runWithConcurrency } from '../../utils/concurrency';
 import { resolveProfileModView, type ProfileModView } from '../../utils/profileModView';
+import { matchesProfileModStatus, PROFILE_MOD_STATUS_FILTERS, type ProfileModStatusFilter } from '../../utils/profileModFilter';
 
 const MAX_PARALLEL_TOGGLES = 10;
 const formatCount = (count: number, singular: string, plural = `${singular}s`) => (
@@ -258,6 +259,17 @@ export const ProfileSidebar: React.FC<ProfileSidebarProps> = ({
     onRepairRuntime,
 }) => {
     const [searchQuery, setSearchQuery] = useState('');
+    const [statusFilter, setStatusFilter] = useState<ProfileModStatusFilter>('all');
+    const [isStatusFilterOpen, setIsStatusFilterOpen] = useState(false);
+    const statusFilterRef = useRef<HTMLDivElement>(null);
+    useEffect(() => {
+        if (!isStatusFilterOpen) return;
+        const onPointerDown = (event: MouseEvent) => {
+            if (statusFilterRef.current && !statusFilterRef.current.contains(event.target as Node)) setIsStatusFilterOpen(false);
+        };
+        document.addEventListener('mousedown', onPointerDown);
+        return () => document.removeEventListener('mousedown', onPointerDown);
+    }, [isStatusFilterOpen]);
     const searchInputRef = useRef<HTMLInputElement>(null);
     const [isEditing, setIsEditing] = useState(false);
     const [editName, setEditName] = useState('');
@@ -454,15 +466,35 @@ export const ProfileSidebar: React.FC<ProfileSidebarProps> = ({
     // to do with its mod list — a download progress tick, a dialog opening.
     // Unmemoised it lowercased and concatenated three strings per mod on every
     // one of those, which on a 300-mod profile is work done for nothing.
+    const statusCounts = useMemo(() => {
+        const counts: Record<ProfileModStatusFilter, number> = { all: 0, enabled: 0, disabled: 0, deprecated: 0, outdated: 0 };
+        for (const mod of activeProfile?.mods ?? []) {
+            const pkg = mod.source === 'local' ? undefined : packageIndex[parsePackageReference(mod.fullName).packageName.toLowerCase()];
+            for (const { value } of PROFILE_MOD_STATUS_FILTERS) {
+                if (matchesProfileModStatus(value, {
+                    enabled: mod.enabled,
+                    deprecated: !!pkg?.is_deprecated,
+                    outdated: !!pkg && hasNewerVersion(mod.versionNumber, latestVersionNumber(pkg)),
+                })) counts[value]++;
+            }
+        }
+        return counts;
+    }, [activeProfile?.mods, packageIndex]);
     const searchedMods = useMemo(() => {
         const mods = activeProfile?.mods;
         if (!mods) return [];
         const needle = searchQuery.trim().toLowerCase();
-        if (!needle) return mods;
-        return mods.filter((mod) =>
-            `${mod.fullName} ${mod.displayName || ''} ${mod.author || ''}`.toLowerCase().includes(needle)
-        );
-    }, [activeProfile?.mods, searchQuery]);
+        return mods.filter((mod) => {
+            if (needle && !`${mod.fullName} ${mod.displayName || ''} ${mod.author || ''}`.toLowerCase().includes(needle)) return false;
+            if (statusFilter === 'all') return true;
+            const pkg = mod.source === 'local' ? undefined : packageIndex[parsePackageReference(mod.fullName).packageName.toLowerCase()];
+            return matchesProfileModStatus(statusFilter, {
+                enabled: mod.enabled,
+                deprecated: !!pkg?.is_deprecated,
+                outdated: !!pkg && hasNewerVersion(mod.versionNumber, latestVersionNumber(pkg)),
+            });
+        });
+    }, [activeProfile?.mods, searchQuery, statusFilter, packageIndex]);
 
     const displayedMods = useMemo(() => {
         if (renderedModView === 'updates') return searchedMods.filter((mod) => updateIds.has(mod.uuid4));
@@ -865,7 +897,7 @@ export const ProfileSidebar: React.FC<ProfileSidebarProps> = ({
             />
 
             {/* Local Mod Search */}
-            <div className="profile-sidebar-motion-item [--sidebar-motion-order:1] px-4 pt-4 pb-2">
+            <div className="profile-sidebar-motion-item [--sidebar-motion-order:1] relative z-20 px-4 pt-4 pb-2">
                 <div className="flex gap-2">
                     <div className="relative group flex-1 min-w-0">
                         <SearchClearButton
@@ -889,6 +921,47 @@ export const ProfileSidebar: React.FC<ProfileSidebarProps> = ({
                             autoComplete="off"
                             className="w-full pl-9 pr-3 py-2 bg-gray-800 border border-gray-700 rounded-lg text-sm text-white placeholder-gray-500 focus:outline-none focus:border-blue-500 focus:ring-1 focus:ring-blue-500 transition-all"
                         />
+                    </div>
+                    <div className="relative flex-shrink-0" ref={statusFilterRef}>
+                        <button
+                            type="button"
+                            onClick={() => setIsStatusFilterOpen(open => !open)}
+                            title="Filter mods"
+                            aria-label="Filter mods"
+                            aria-expanded={isStatusFilterOpen}
+                            className={`w-[38px] h-[38px] rounded-lg border focus:outline-none focus:ring-1 focus:ring-blue-500 transition-colors flex items-center justify-center ${isStatusFilterOpen || statusFilter !== 'all'
+                                ? 'bg-blue-600 border-blue-500 text-on-accent shadow-sm'
+                                : 'bg-gray-800 border-gray-700 text-gray-400 hover:text-white hover:border-blue-500 focus:border-blue-500'}`}
+                        >
+                            <svg className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2} aria-hidden="true">
+                                <polygon points="22 3 2 3 10 12.46 10 19 14 21 14 12.46 22 3" />
+                            </svg>
+                        </button>
+                        {isStatusFilterOpen && (
+                            <div className="absolute top-full mt-1.5 right-0 w-52 bg-gray-800 border border-gray-700 rounded-xl shadow-2xl z-50 p-1.5">
+                                {PROFILE_MOD_STATUS_FILTERS.map(option => {
+                                    const selected = statusFilter === option.value;
+                                    return (
+                                        <button
+                                            key={option.value}
+                                            type="button"
+                                            aria-pressed={selected}
+                                            onClick={() => {
+                                                clearSelections();
+                                                setStatusFilter(option.value);
+                                                setIsStatusFilterOpen(false);
+                                            }}
+                                            className={`w-full flex items-center justify-between gap-3 rounded-lg px-3 py-1.5 text-sm transition-colors ${selected
+                                                ? 'bg-blue-600/20 text-fg-accent font-semibold'
+                                                : 'text-gray-300 hover:bg-gray-700/60 hover:text-white'}`}
+                                        >
+                                            {option.label}
+                                            <span className={`text-xs tabular-nums ${selected ? '' : 'text-gray-500'}`}>{statusCounts[option.value]}</span>
+                                        </button>
+                                    );
+                                })}
+                            </div>
+                        )}
                     </div>
                     <button
                         type="button"
@@ -1347,7 +1420,7 @@ export const ProfileSidebar: React.FC<ProfileSidebarProps> = ({
                         <p className="mt-1 text-xs text-gray-600">
                             {renderedModView === 'updates' && profileUpdates.length === 0
                                 ? 'Updates will appear here when available.'
-                                : 'Try a different search.'}
+                                : 'Try a different search or filter.'}
                         </p>
                     </div>
                 )}
