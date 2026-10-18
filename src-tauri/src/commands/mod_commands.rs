@@ -2973,11 +2973,49 @@ fn extract_lovely_zip_to_game_root<R: std::io::Read + std::io::Seek>(
         let mut outfile = fs::File::create(&outpath).map_err(|e| e.to_string())?;
         std::io::copy(&mut file, &mut outfile).map_err(|e| e.to_string())?;
         if lower == "run_lovely_macos.sh" {
+            drop(outfile);
+            make_lovely_script_portable(&outpath)?;
             set_script_executable(&outpath)?;
         }
     }
 
     Ok(())
+}
+
+/// Lovely's macOS launch script hard-codes the default Steam library
+/// (`defaultpath=".../steamapps/common/Balatro"`) and `cd`s there. A Balatro
+/// in another library then launches whatever copy sits at the default path,
+/// without Lovely, and dies at once. Point the script at its own folder
+/// instead. Leaves a script without that line, or already fixed, alone.
+pub(crate) fn make_lovely_script_portable(script: &std::path::Path) -> Result<(), String> {
+    const PORTABLE: &str = r#"defaultpath="$(cd "$(dirname "$0")" && pwd)""#;
+    let Ok(content) = fs::read_to_string(script) else {
+        return Ok(());
+    };
+    let mut changed = false;
+    let patched = content
+        .lines()
+        .map(|line| {
+            if line.trim_start().starts_with("defaultpath=") && line.trim() != PORTABLE {
+                changed = true;
+                PORTABLE.to_string()
+            } else {
+                line.to_string()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    if !changed {
+        return Ok(());
+    }
+    let patched = if content.ends_with('\n') {
+        format!("{patched}\n")
+    } else {
+        patched
+    };
+    fs::write(script, patched)
+        .map_err(|error| format!("Could not update {}: {error}", script.display()))?;
+    set_script_executable(script)
 }
 
 fn extract_lovely_tarball_to_game_root(
@@ -3010,6 +3048,8 @@ fn extract_lovely_tarball_to_game_root(
         let mut outfile = fs::File::create(&outpath).map_err(|e| e.to_string())?;
         std::io::copy(&mut entry, &mut outfile).map_err(|e| e.to_string())?;
         if lower == "run_lovely_macos.sh" {
+            drop(outfile);
+            make_lovely_script_portable(&outpath)?;
             set_script_executable(&outpath)?;
         }
     }
@@ -10452,6 +10492,33 @@ mod r2mmignore_install_tests {
             linked_mod_folder_name("lethal-company", plain, "Me-WipMod-0.1.0", &root),
             "Me-WipMod-0.1.0"
         );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn the_lovely_script_starts_from_its_own_folder() {
+        use super::make_lovely_script_portable;
+        let root = scratch("lovely-script");
+        let script = root.join("run_lovely_macos.sh");
+        fs::write(
+            &script,
+            "#!/bin/bash\ngamename=\"Balatro\"\nexename=\"$gamename\"\ndefaultpath=\"/Users/$USER/Library/Application Support/Steam/steamapps/common/$gamename\"\n\nexport DYLD_INSERT_LIBRARIES=liblovely.dylib\n\ncd \"$defaultpath\"\n./$exename.app/Contents/MacOS/love \"$@\"\n",
+        )
+        .unwrap();
+
+        make_lovely_script_portable(&script).unwrap();
+        let patched = fs::read_to_string(&script).unwrap();
+        assert!(patched.contains("defaultpath=\"$(cd \"$(dirname \"$0\")\" && pwd)\"\n"));
+        assert!(!patched.contains("steamapps/common"));
+        assert!(patched.contains("cd \"$defaultpath\""));
+        assert!(patched.ends_with("\"$@\"\n"));
+
+        // Running it again changes nothing.
+        make_lovely_script_portable(&script).unwrap();
+        assert_eq!(fs::read_to_string(&script).unwrap(), patched);
+
+        // A missing script is not an error.
+        make_lovely_script_portable(&root.join("missing.sh")).unwrap();
         fs::remove_dir_all(root).unwrap();
     }
 }

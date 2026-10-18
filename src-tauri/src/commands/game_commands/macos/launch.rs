@@ -1,6 +1,33 @@
 use super::super::owml_patcher;
 use super::super::*;
 
+/// How long a just-started game is watched for dying before it is up.
+const EARLY_EXIT_WINDOW_MS: u64 = 3_000;
+
+/// A game that dies while dyld is still loading it — a missing
+/// liblovely.dylib, say — never shows up as a process, and the launch then
+/// waited a full minute for it with the stop button lit. Say so instead.
+fn fail_if_exited_at_once(child: &mut std::process::Child) -> Result<(), String> {
+    let deadline =
+        std::time::Instant::now() + std::time::Duration::from_millis(EARLY_EXIT_WINDOW_MS);
+    while std::time::Instant::now() < deadline {
+        match child.try_wait() {
+            Ok(Some(status)) if !status.success() => {
+                log::warn!(
+                    "[launch_game_with_mods] The game exited right after starting: {}",
+                    status
+                );
+                return Err(format!(
+                    "The game closed as soon as it started ({status}). Apply the profile again so the mod loader is in place, then launch again."
+                ));
+            }
+            Ok(Some(_)) | Err(_) => return Ok(()),
+            Ok(None) => std::thread::sleep(std::time::Duration::from_millis(100)),
+        }
+    }
+    Ok(())
+}
+
 /// How long to wait for BepInEx to announce itself after the game is up.
 const BEPINEX_LOG_GRACE_MS: u64 = 20_000;
 
@@ -166,11 +193,36 @@ pub(crate) async fn launch_game_with_mods_for_macos(
         set_executable_if_present(&run_script)?;
         dequarantine_recursive(game_path);
 
-        std::process::Command::new("/bin/sh")
-            .arg(&run_script)
-            .current_dir(game_path)
-            .spawn()
-            .map_err(|e| format!("Failed to launch run_lovely_macos.sh: {}", e))?;
+        // Lovely's own script `cd`s into the default Steam library before it
+        // starts the game. With Balatro in another library that runs whatever
+        // copy sits at the default path, without Lovely beside it, and the
+        // game dies the moment dyld cannot find liblovely.dylib. Starting the
+        // game here, from this folder and with an absolute library path, runs
+        // the copy r2modmac installed Lovely into.
+        let lovely = game_path.join("liblovely.dylib");
+        let direct = executable_path
+            .as_ref()
+            .filter(|executable| executable.is_file() && lovely.is_file());
+        if let Some(executable) = direct {
+            log::info!(
+                "[launch_game_with_mods] Starting {} with Lovely from {}",
+                executable.display(),
+                lovely.display()
+            );
+            let mut child = std::process::Command::new(executable)
+                .env("DYLD_INSERT_LIBRARIES", &lovely)
+                .current_dir(game_path)
+                .spawn()
+                .map_err(|e| format!("Failed to launch Balatro with Lovely: {}", e))?;
+            fail_if_exited_at_once(&mut child)?;
+        } else {
+            let mut child = std::process::Command::new("/bin/sh")
+                .arg(&run_script)
+                .current_dir(game_path)
+                .spawn()
+                .map_err(|e| format!("Failed to launch run_lovely_macos.sh: {}", e))?;
+            fail_if_exited_at_once(&mut child)?;
+        }
 
         if let Some(executable_path) = executable_path.as_ref() {
             let observed = wait_for_process_start(executable_path, 60_000);
@@ -641,5 +693,18 @@ mod bepinex_takeover_signal_tests {
         ));
 
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_game_that_dies_at_once_is_reported_instead_of_awaited() {
+        let mut crashed = std::process::Command::new("/bin/sh")
+            .args(["-c", "exit 134"])
+            .spawn()
+            .unwrap();
+        let error = super::fail_if_exited_at_once(&mut crashed).unwrap_err();
+        assert!(error.contains("closed as soon as it started"), "{error}");
+
+        let mut clean = std::process::Command::new("/usr/bin/true").spawn().unwrap();
+        assert!(super::fail_if_exited_at_once(&mut clean).is_ok());
     }
 }

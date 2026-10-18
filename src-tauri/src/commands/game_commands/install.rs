@@ -234,6 +234,10 @@ pub async fn install_to_game(
             return Err("No macOS Lovely runtime found".to_string());
         }
 
+        // Existing installs got Lovely's script as shipped; fix it on Apply.
+        crate::commands::legacy_mod_commands::make_lovely_script_portable(
+            &game_path.join(BALATRO_LOVELY_SCRIPT),
+        )?;
         set_executable_if_present(&game_path.join(BALATRO_LOVELY_SCRIPT))?;
         dequarantine_recursive(game_path);
         if mods_dir.exists() {
