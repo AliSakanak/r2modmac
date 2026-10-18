@@ -727,10 +727,6 @@ export function useGameSync({
                 message += `\n\nFailed ${failedInstalls.length} mod(s) during sync:\n${preview}${more}`;
             }
 
-            if (community === 'balatro' && message !== 'Profile already synced! No changes needed.') {
-                message += '\n\nBalatro macOS: mod files are synced to ~/Library/Application Support/Balatro/Mods. Launch the modded game with run_lovely_macos.sh.';
-            }
-
             if (!silentSuccess) {
                 await window.ipcRenderer.alert('Success', message);
             }
