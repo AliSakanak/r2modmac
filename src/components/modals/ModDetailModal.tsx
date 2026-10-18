@@ -3,6 +3,7 @@ import type { ModSource, PackageVersion, Package } from '../../types/thunderstor
 import type { InstalledMod } from '../../types/profile';
 import DOMPurify from 'dompurify';
 import { LikeStat } from '../LikeStat';
+import { firstKnownCount, knownCount, knownSize } from '../../utils/packageStats';
 import { readScrollFades, ScrollFades } from '../ui/ScrollFades';
 import { StoreLogo } from '../ui/StoreLogo';
 import { sourceName } from '../../utils/storeProviders';
@@ -519,8 +520,10 @@ export function ModDetailModal({
     };
 
     // Calculate total size including dependencies
-    const totalBytes = mod.file_size + dependencies.reduce((sum, dep) => sum + (dep.versions[0]?.file_size || 0), 0);
-    const sizeDisplay = dependencies.length > 0 ? formatBytes(totalBytes) : formatBytes(mod.file_size);
+    const totalBytes = (knownSize(mod.file_size) ?? 0)
+        + dependencies.reduce((sum, dep) => sum + (knownSize(dep.versions[0]?.file_size) ?? 0), 0);
+    const sizeDisplay = knownSize(totalBytes) !== null ? formatBytes(totalBytes) : null;
+    const packageDownloads = firstKnownCount(pkg.total_downloads, mod.downloads);
     const detailTabs: Tab[] = isLocalMod ? ['description'] : ['description', 'changelog', 'dependencies'];
 
     return (
@@ -620,27 +623,29 @@ export function ModDetailModal({
                             <div className="mt-3 flex flex-wrap items-center gap-x-4 gap-y-2 text-xs text-gray-500">
                                 {!isLocalMod && (
                                     <>
-                                        <span className="flex items-center gap-1.5" title={`${(pkg.total_downloads ?? mod.downloads).toLocaleString()} total package downloads`}>
-                                            <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                                                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4" />
-                                            </svg>
-                                            {(pkg.total_downloads ?? mod.downloads).toLocaleString()}
-                                        </span>
+                                        {packageDownloads !== null ? (
+                                            <span className="flex items-center gap-1.5" title={`${packageDownloads.toLocaleString()} total package downloads`}>
+                                                <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4" />
+                                                </svg>
+                                                {packageDownloads.toLocaleString()}
+                                            </span>
+                                        ) : null}
                                         <LikeStat
                                             count={pkg.rating_score}
                                             className="gap-1.5 text-rose-400"
                                             iconClassName="w-4 h-4"
-                                            title={`${pkg.rating_score.toLocaleString()} likes`}
+                                            title={`${(knownCount(pkg.rating_score) ?? 0).toLocaleString()} likes`}
                                         />
                                     </>
                                 )}
-                                <span className="flex items-center gap-1.5" title={dependencies.length > 0 ? `Package: ${formatBytes(mod.file_size)} + ${dependencies.length} dependencies` : undefined}>
+                                {sizeDisplay !== null ? <span className="flex items-center gap-1.5" title={dependencies.length > 0 ? `Package: ${formatBytes(knownSize(mod.file_size) ?? 0)} + ${dependencies.length} dependencies` : undefined}>
                                     <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                                         <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M20 7l-8-4-8 4m16 0l-8 4m8-4v10l-8 4m0-10L4 7m8 4v10M4 7v10l8 4" />
                                     </svg>
                                     {sizeDisplay}
                                     {dependencies.length > 0 && <span className="text-gray-600 text-[10px] ml-0.5">(total)</span>}
-                                </span>
+                                </span> : null}
                             </div>
                         </div>
 

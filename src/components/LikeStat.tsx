@@ -1,4 +1,5 @@
 import type { SVGProps } from 'react';
+import { knownCount } from '../utils/packageStats';
 
 type HeartIconProps = SVGProps<SVGSVGElement>;
 
@@ -37,7 +38,9 @@ export function LikeStat({
     title = 'Likes',
     compact = false,
 }: LikeStatProps) {
-    const safeCount = typeof count === 'number' && Number.isFinite(count) ? count : 0;
+    // A provider that does not report likes sends -1 or nothing: say nothing.
+    const safeCount = knownCount(count);
+    if (safeCount === null) return null;
 
     return (
         <span className={`inline-flex items-center ${className}`} title={compact ? `${safeCount.toLocaleString()} ${title.toLowerCase()}` : title} aria-label={`${safeCount.toLocaleString()} ${title.toLowerCase()}`}>

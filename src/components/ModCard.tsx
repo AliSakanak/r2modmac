@@ -2,6 +2,7 @@ import { memo } from 'react';
 import type { PackageVersion } from '../types/thunderstore';
 import { LazyImage } from './LazyImage';
 import { LikeStat } from './LikeStat';
+import { firstKnownCount, knownSize } from '../utils/packageStats';
 
 interface ModCardProps {
     mod: PackageVersion;
@@ -30,7 +31,8 @@ function formatCompact(value: number): string {
 export const ModCard = memo(function ModCard({ mod, likesCount, totalDownloads, onInstall, onUninstall, onClick, installStatus, isBrowsing, legacyInstallMode = false }: ModCardProps) {
     const installedLabel = legacyInstallMode ? 'Installed' : 'Added';
     const installLabel = legacyInstallMode ? 'Install' : 'Add';
-    const displayedDownloads = totalDownloads ?? mod.downloads;
+    const displayedDownloads = firstKnownCount(totalDownloads, mod.downloads);
+    const fileSize = knownSize(mod.file_size);
 
     return (
         <div
@@ -89,22 +91,24 @@ export const ModCard = memo(function ModCard({ mod, likesCount, totalDownloads, 
             {/* Footer: Stats & Action */}
             <div className="flex min-w-0 items-center justify-between gap-2 mt-auto pt-3 border-t border-gray-700/50">
                 <div className="flex min-w-0 flex-nowrap items-center gap-2 overflow-hidden whitespace-nowrap text-xs text-gray-500 font-medium">
-                    <div className="flex shrink-0 items-center gap-1" title={`${displayedDownloads.toLocaleString()} total package downloads`} aria-label={`${displayedDownloads.toLocaleString()} total package downloads`}>
-                        <svg className="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4" /></svg>
-                        {formatCompact(displayedDownloads)}
-                    </div>
+                    {displayedDownloads !== null ? (
+                        <div className="flex shrink-0 items-center gap-1" title={`${displayedDownloads.toLocaleString()} total package downloads`} aria-label={`${displayedDownloads.toLocaleString()} total package downloads`}>
+                            <svg className="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4" /></svg>
+                            {formatCompact(displayedDownloads)}
+                        </div>
+                    ) : null}
                     <LikeStat count={likesCount} compact className="shrink-0 gap-1 text-rose-400" iconClassName="w-3.5 h-3.5" />
                     {mod.dependencies && mod.dependencies.length >= 5 ? (
                         <div className="flex items-center gap-1 text-indigo-400">
                             <svg className="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 11H5m14 0a2 2 0 012 2v6a2 2 0 01-2 2H5a2 2 0 01-2-2v-6a2 2 0 012-2m14 0V9a2 2 0 00-2-2M5 11V9a2 2 0 012-2m0 0V5a2 2 0 012-2h6a2 2 0 012 2v2M7 7h10" /></svg>
                             {mod.dependencies.length} mods
                         </div>
-                    ) : (
-                        <div className="mod-card-file-size flex shrink-0 items-center gap-1" title={`${mod.file_size.toLocaleString()} bytes`}>
+                    ) : fileSize !== null ? (
+                        <div className="mod-card-file-size flex shrink-0 items-center gap-1" title={`${fileSize.toLocaleString()} bytes`}>
                             <svg className="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M20 7l-8-4-8 4m16 0l-8 4m8-4v10l-8 4m0-10L4 7m8 4v10M4 7v10l8 4" /></svg>
-                            {formatBytes(mod.file_size)}
+                            {formatBytes(fileSize)}
                         </div>
-                    )}
+                    ) : null}
                 </div>
 
                 <div className="flex shrink-0 gap-2">

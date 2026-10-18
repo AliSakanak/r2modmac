@@ -3,6 +3,7 @@ import { memo } from 'react';
 import type { PackageVersion } from '../types/thunderstore';
 import { LazyImage } from './LazyImage';
 import { LikeStat } from './LikeStat';
+import { firstKnownCount, knownSize } from '../utils/packageStats';
 
 // Defined outside the component so it is not recreated on every render
 function formatBytes(bytes: number): string {
@@ -27,7 +28,8 @@ interface ModListItemProps {
 export const ModListItem = memo(function ModListItem({ mod, likesCount, totalDownloads, onInstall, onUninstall, onClick, installStatus, isBrowsing, legacyInstallMode = false }: ModListItemProps) {
     const installedLabel = legacyInstallMode ? 'Installed' : 'Added';
     const installLabel = legacyInstallMode ? 'Install' : 'Add';
-    const displayedDownloads = totalDownloads ?? mod.downloads;
+    const displayedDownloads = firstKnownCount(totalDownloads, mod.downloads);
+    const fileSize = knownSize(mod.file_size);
 
     return (
         <div
@@ -85,10 +87,12 @@ export const ModListItem = memo(function ModListItem({ mod, likesCount, totalDow
 
             {/* Stats */}
             <div className={`mod-list-stats flex flex-col items-end gap-1 text-xs text-gray-500 font-medium justify-center flex-shrink-0 ${isBrowsing ? 'ml-auto mr-4' : 'w-24 mr-2'}`}>
-                <div className="flex items-center flex-row-reverse gap-1.5" title="Total package downloads">
-                    <svg className="w-3.5 h-3.5 text-gray-600" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4" /></svg>
-                    <span className="text-gray-400">{displayedDownloads.toLocaleString()}</span>
-                </div>
+                {displayedDownloads !== null ? (
+                    <div className="flex items-center flex-row-reverse gap-1.5" title="Total package downloads">
+                        <svg className="w-3.5 h-3.5 text-gray-600" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4" /></svg>
+                        <span className="text-gray-400">{displayedDownloads.toLocaleString()}</span>
+                    </div>
+                ) : null}
 
                 <LikeStat count={likesCount} className="flex-row-reverse gap-1.5 text-rose-400" iconClassName="w-3.5 h-3.5" />
 
@@ -97,12 +101,12 @@ export const ModListItem = memo(function ModListItem({ mod, likesCount, totalDow
                         <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 11H5m14 0a2 2 0 012 2v6a2 2 0 01-2 2H5a2 2 0 01-2-2v-6a2 2 0 012-2m14 0V9a2 2 0 00-2-2M5 11V9a2 2 0 012-2m0 0V5a2 2 0 012-2h6a2 2 0 012 2v2M7 7h10" /></svg>
                         <span>{mod.dependencies.length} mods</span>
                     </div>
-                ) : (
+                ) : fileSize !== null ? (
                     <div className="flex items-center flex-row-reverse gap-1.5" title="File Size">
                         <svg className="w-3.5 h-3.5 text-gray-600" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M20 7l-8-4-8 4m16 0l-8 4m8-4v10l-8 4m0-10L4 7m8 4v10M4 7v10l8 4" /></svg>
-                        <span className="text-gray-400">{formatBytes(mod.file_size)}</span>
+                        <span className="text-gray-400">{formatBytes(fileSize)}</span>
                     </div>
-                )}
+                ) : null}
             </div>
 
             {/* Actions */}
