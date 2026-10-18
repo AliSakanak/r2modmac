@@ -6,6 +6,8 @@ use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use tauri::AppHandle;
 
+use crate::utils::mod_ignore::{is_ignored_mod_dir, is_in_ignored_plugin_folder};
+
 pub const GAME_MANIFEST_SCOPE: &str = "game";
 /// For loaders that install into the profile instead of the game folder.
 pub const PROFILE_MANIFEST_SCOPE: &str = "profile";
@@ -412,6 +414,7 @@ fn best_effort_remove_generated_entries(
             let name = entry.file_name().to_string_lossy().to_string();
             if !entry_matches_terms(&name, &removed_terms)
                 || entry_matches_terms(&name, &kept_terms)
+                || is_ignored_mod_dir(&path)
             {
                 continue;
             }
@@ -462,7 +465,9 @@ pub fn cleanup_owned_mod_manifests(
             .collect::<HashSet<_>>();
 
         for relative in &entry.manifest.files {
-            if kept_paths.contains(relative) {
+            // A folder marked after the install now holds the author's work,
+            // whatever the manifest remembers putting there.
+            if kept_paths.contains(relative) || is_in_ignored_plugin_folder(target_root, relative) {
                 continue;
             }
 
@@ -511,6 +516,7 @@ pub fn cleanup_owned_mod_manifests(
                 || backup_paths
                     .iter()
                     .any(|path| path == &scoped_root || path.starts_with(&scoped_prefix))
+                || is_in_ignored_plugin_folder(target_root, &scoped_root)
             {
                 continue;
             }
@@ -569,7 +575,10 @@ pub fn deactivate_exact_owned_mod_manifests(
             {
                 return Err(format!("Unsafe owned mod path: {relative}"));
             }
-            if kept_paths.contains(relative) || relative.to_ascii_lowercase().contains("/config/") {
+            if kept_paths.contains(relative)
+                || relative.to_ascii_lowercase().contains("/config/")
+                || is_in_ignored_plugin_folder(target_root, relative)
+            {
                 continue;
             }
             let mut parent = target_root.to_path_buf();
@@ -801,6 +810,26 @@ mod shared_loader_cleanup_tests {
         assert!(root.join(shared).is_file());
         assert!(!root.join(deprecated_only).exists());
         assert!(!deprecated_manifest.exists());
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_plugin_folder_marked_after_install_survives_uninstall_and_switch() {
+        let root = world();
+        let wip = root.join("BepInEx/plugins/Me-Wip");
+        fs::create_dir_all(&wip).unwrap();
+        fs::write(wip.join("Wip.dll"), b"edited in place").unwrap();
+        fs::write(wip.join(crate::utils::mod_ignore::IGNORE_MARKER), b"").unwrap();
+        let files = ["BepInEx/plugins/Me-Wip/Wip.dll"];
+
+        let uninstalled = stored(&root, "Me-Wip", &files);
+        cleanup_owned_mod_manifests(&root, &[uninstalled], &[]).unwrap();
+        assert_eq!(fs::read(wip.join("Wip.dll")).unwrap(), b"edited in place");
+
+        let outgoing = stored(&root, "Me-Wip", &files);
+        deactivate_exact_owned_mod_manifests(&root, &[outgoing], &[]).unwrap();
+        assert_eq!(fs::read(wip.join("Wip.dll")).unwrap(), b"edited in place");
 
         fs::remove_dir_all(root).unwrap();
     }

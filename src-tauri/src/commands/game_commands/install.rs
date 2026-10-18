@@ -537,7 +537,9 @@ pub async fn install_to_game(
         // Check game plugins and remove those not in profile OR disabled
         if let Ok(game_entries) = fs::read_dir(&game_plugins) {
             for entry in game_entries.filter_map(|e| e.ok()) {
-                if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                if entry.file_type().map(|t| t.is_dir()).unwrap_or(false)
+                    && !crate::utils::mod_ignore::is_ignored_mod_dir(&entry.path())
+                {
                     let folder_name = entry.file_name().to_string_lossy().to_string();
 
                     // Check if mod is disabled or not in enabled list
@@ -596,7 +598,11 @@ pub async fn install_to_game(
                                     .any(|d| dest_plugin_name.to_lowercase().contains(d));
 
                                 // Remove if disabled or not in source
-                                if is_disabled || !source_plugin_path.exists() {
+                                if (is_disabled || !source_plugin_path.exists())
+                                    && !crate::utils::mod_ignore::is_ignored_mod_dir(
+                                        &dest_entry.path(),
+                                    )
+                                {
                                     let dest_plugin_path = dest_entry.path();
                                     if dest_plugin_path.is_symlink() {
                                         let _ = fs::remove_file(&dest_plugin_path);
@@ -634,6 +640,11 @@ pub async fn install_to_game(
 
                                 let plugin_dst = dst_path.join(&plugin_name);
                                 let plugin_src = plugin_entry.path();
+                                if crate::utils::mod_ignore::is_ignored_mod_dir(&plugin_dst)
+                                    && !plugin_dst.is_symlink()
+                                {
+                                    continue;
+                                }
 
                                 // Remove existing file/dir/symlink if present
                                 if plugin_dst.exists() || plugin_dst.is_symlink() {

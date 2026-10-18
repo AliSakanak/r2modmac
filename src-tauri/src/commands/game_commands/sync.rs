@@ -1,6 +1,731 @@
 use super::*;
 use crate::tracing::{perfetto_te_ns, scoped_track_event, EventContext, TrackEventDebugArg};
+use crate::utils::mod_ignore::{ignored_mod_folders, is_ignored_mod_dir};
 use crate::utils::mod_manifest::save_owned_mod_manifest;
+
+/// The keys of the `.r2mmignore`-marked folders in `mods_root`, logging each
+/// one, and saying so when the profile asks for a mod the folder stands in for.
+fn log_ignored_mod_folders(
+    mods_root: &std::path::Path,
+    key_of: impl Fn(&str, &std::path::Path) -> String,
+    desired_keys: &std::collections::HashSet<String>,
+) -> std::collections::HashSet<String> {
+    ignored_mod_folders(mods_root)
+        .into_iter()
+        .map(|(name, path)| {
+            let key = key_of(&name, &path);
+            if desired_keys.contains(&key) {
+                log::warn!(
+                    "[sync_profile_to_game] {} carries .r2mmignore and stands in for the profile's {}; that mod is not installed over it",
+                    name,
+                    key
+                );
+            } else {
+                log::info!("[sync_profile_to_game] Leaving {} alone: it carries .r2mmignore", name);
+            }
+            key
+        })
+        .collect()
+}
+
+/// `Author-ModName`, lowercased: the key a profile mod and a game folder share.
+fn sync_mod_key(name: &str) -> String {
+    let parts: Vec<&str> = name.split('-').collect();
+    if parts.len() >= 2 {
+        format!("{}-{}", parts[0], parts[1]).to_lowercase()
+    } else {
+        name.to_lowercase()
+    }
+}
+
+/// The trailing `1.2.3` of a folder or package name, when it has one.
+fn sync_version_suffix(name: &str) -> Option<String> {
+    name.rsplit('-').next().and_then(|tail| {
+        if tail.contains('.') && tail.chars().all(|c| c.is_ascii_digit() || c == '.') {
+            Some(tail.to_lowercase())
+        } else {
+            None
+        }
+    })
+}
+
+/// Reconcile Balatro's shared mods folder with a profile, as Apply does.
+///
+/// Kept apart from `sync_profile_to_game` so it can run against a scratch
+/// folder: everything it touches arrives as an argument.
+#[allow(clippy::too_many_arguments)]
+fn sync_balatro_mods(
+    mods_root: &std::path::Path,
+    profile_mods_cache: &std::path::Path,
+    lovely_installed: bool,
+    desired_key_set: &std::collections::HashSet<String>,
+    desired_full_by_key: &std::collections::HashMap<String, String>,
+    desired_version_by_key: &std::collections::HashMap<String, String>,
+    finalize: bool,
+    use_cache: bool,
+    needs_config_switch: bool,
+    apply_configs: impl FnOnce(),
+) -> Result<serde_json::Value, String> {
+    let extract_mod_key = sync_mod_key;
+    let extract_version_suffix = sync_version_suffix;
+
+    let balatro_folder_key = |folder_name: &str| {
+        if folder_name.eq_ignore_ascii_case("smods") {
+            "steamopollys-steamodded".to_string()
+        } else {
+            extract_mod_key(folder_name)
+        }
+    };
+    // Marked folders are invisible to the diff: nothing removes or caches
+    // them, and a profile mod with the same key counts as present so its
+    // install cannot overwrite the work in progress.
+    let ignored_keys = log_ignored_mod_folders(
+        mods_root,
+        |name, _| balatro_folder_key(name),
+        desired_key_set,
+    );
+
+    let mut game_mod_folders: Vec<(String, String, Option<String>)> = vec![];
+    if mods_root.exists() {
+        if let Ok(entries) = fs::read_dir(mods_root) {
+            for entry in entries.filter_map(|e| e.ok()) {
+                if entry.path().is_dir() && !is_ignored_mod_dir(&entry.path()) {
+                    let folder_name = entry.file_name().to_string_lossy().to_string();
+                    let mod_key = balatro_folder_key(&folder_name);
+                    let version = extract_version_suffix(&folder_name)
+                        .or_else(|| read_manifest_version(&entry.path()));
+                    game_mod_folders.push((folder_name, mod_key, version));
+                }
+            }
+        }
+    }
+
+    let mut to_remove: Vec<String> = Vec::new();
+    for (folder_name, gm_key, game_version) in &game_mod_folders {
+        if !desired_key_set.contains(gm_key) {
+            to_remove.push(folder_name.clone());
+            continue;
+        }
+
+        let desired_version = desired_version_by_key.get(gm_key);
+        let desired_full = desired_full_by_key.get(gm_key);
+        let full_mismatch = desired_full
+            .map(|full| {
+                folder_name.to_lowercase() != *full && !folder_name.eq_ignore_ascii_case("smods")
+            })
+            .unwrap_or(false);
+        let needs_replacement = match desired_version {
+            Some(dv) => match game_version.as_ref() {
+                Some(gv) => gv != dv,
+                None => full_mismatch,
+            },
+            None => false,
+        };
+
+        if needs_replacement && full_mismatch {
+            to_remove.push(folder_name.clone());
+        }
+    }
+
+    let mut to_install: Vec<String> = desired_key_set
+        .iter()
+        .filter(|pm_key| {
+            if *pm_key == "thunderstore-lovely" {
+                return !lovely_installed;
+            }
+            if ignored_keys.contains(*pm_key) {
+                return false;
+            }
+
+            let desired_full = desired_full_by_key
+                .get(*pm_key)
+                .cloned()
+                .unwrap_or_default();
+            let desired_version = desired_version_by_key.get(*pm_key);
+
+            let has_exact_version =
+                game_mod_folders
+                    .iter()
+                    .any(|(folder_name, gm_key, game_version)| {
+                        if gm_key != *pm_key {
+                            return false;
+                        }
+
+                        if let Some(dv) = desired_version {
+                            if let Some(gv) = game_version {
+                                return gv == dv;
+                            }
+                            if folder_name.eq_ignore_ascii_case("smods") {
+                                return true;
+                            }
+                            return folder_name.to_lowercase() == desired_full;
+                        }
+
+                        true
+                    });
+
+            !has_exact_version
+        })
+        .map(|k| k.to_string())
+        .collect();
+    to_install.sort();
+
+    ensure_finalize_ready(finalize, to_install.len())?;
+
+    let mut removed = 0;
+    if finalize {
+        apply_configs();
+        for folder_name in &to_remove {
+            let folder_path = mods_root.join(folder_name);
+            if folder_path.exists() {
+                let _ = fs::remove_dir_all(&folder_path);
+                removed += 1;
+            }
+        }
+    }
+
+    let mut cached = 0;
+    if finalize && use_cache && mods_root.exists() {
+        if !profile_mods_cache.exists() {
+            let _ = fs::create_dir_all(profile_mods_cache);
+        }
+
+        if let Ok(entries) = fs::read_dir(mods_root) {
+            for entry in entries.filter_map(|e| e.ok()) {
+                if entry.path().is_dir() && !is_ignored_mod_dir(&entry.path()) {
+                    let folder_name = entry.file_name().to_string_lossy().to_string();
+                    let cache_path = profile_mods_cache.join(&folder_name);
+                    if !cache_path.exists() {
+                        if copy_dir_recursive(&entry.path(), &cache_path).is_ok() {
+                            cached += 1;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(serde_json::json!({
+        "removed": removed,
+        "to_install": to_install,
+        "already_installed": game_mod_folders.len(),
+        "cached": cached,
+        "pending_removals": if finalize { 0 } else { to_remove.len() },
+        "needs_config_switch": !finalize && needs_config_switch
+    }))
+}
+
+/// Reconcile Outer Wilds' OWML mods folder with a profile, as Apply does.
+///
+/// Kept apart from `sync_profile_to_game` so it can run against a scratch
+/// game folder: everything it touches arrives as an argument.
+#[allow(clippy::too_many_arguments)]
+fn sync_outerwilds_mods(
+    game_path: &std::path::Path,
+    profile: &serde_json::Value,
+    profile_dir: &std::path::Path,
+    profile_is_vanilla: bool,
+    desired_key_set: &std::collections::HashSet<String>,
+    desired_version_by_key: &std::collections::HashMap<String, String>,
+    finalize: bool,
+    use_cache: bool,
+    needs_config_switch: bool,
+    apply_configs: impl FnOnce(),
+    capture_configs: impl FnOnce(),
+) -> Result<serde_json::Value, String> {
+    let extract_mod_key = sync_mod_key;
+    let extract_version_suffix = sync_version_suffix;
+
+    let owml_folder = game_path.join("OWML");
+    let owml_disabled = game_path.join("OWML_DISABLED");
+    if !profile_is_vanilla {
+        if owml_disabled.exists() && !owml_folder.exists() {
+            let _ = fs::rename(&owml_disabled, &owml_folder);
+            log::info!("[sync_profile_to_game] Restored OWML_DISABLED -> OWML");
+        }
+    }
+
+    // Resolve the actual OWML directory: it may be OWML or OWML_DISABLED depending on
+    // whether the profile is currently in vanilla mode. After the potential restore above
+    // (lines 150-154), OWML should be back if !profile_is_vanilla. For vanilla mode, the
+    // folder may still be at OWML_DISABLED from a previous sync, so we check both.
+    let owml_dir = if owml_folder.exists() {
+        owml_folder.clone()
+    } else if owml_disabled.exists() {
+        // OWML was previously disabled (vanilla mode). Use OWML_DISABLED as the working dir
+        // for reading mods and writing config.json so that individually-disabled mods are
+        // correctly updated even while the profile stays in vanilla mode.
+        owml_disabled.clone()
+    } else {
+        // Neither exists yet (fresh install). Default to OWML.
+        owml_folder.clone()
+    };
+    let owml_mods_dir = owml_dir.join("Mods");
+    let profile_owml_cache = profile_dir.join("OWML").join("Mods");
+
+    // Read manifest.json uniqueName from a mod folder to derive the mod key.
+    let read_owml_unique_name = |mod_dir: &std::path::Path| -> Option<String> {
+        let manifest_path = mod_dir.join("manifest.json");
+        if let Ok(data) = fs::read_to_string(&manifest_path) {
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&data) {
+                if let Some(unique_name) = v["uniqueName"].as_str() {
+                    // Convert dots to hyphens for Thunderstore key matching
+                    return Some(unique_name.replace('.', "-").to_lowercase());
+                }
+            }
+        }
+        None
+    };
+
+    // Read installed version from a mod's manifest.json
+    let read_owml_version = |mod_dir: &std::path::Path| -> Option<String> {
+        let manifest_path = mod_dir.join("manifest.json");
+        if let Ok(data) = fs::read_to_string(&manifest_path) {
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&data) {
+                return v["version"].as_str().map(|s| s.to_string());
+            }
+        }
+        None
+    };
+
+    let owml_installed = owml_dir.join("OWML.Launcher.exe").exists();
+    let ignored_keys = log_ignored_mod_folders(
+        &owml_mods_dir,
+        |name, path| read_owml_unique_name(path).unwrap_or_else(|| extract_mod_key(name)),
+        desired_key_set,
+    );
+
+    // Scan installed mods
+    let mut game_mod_folders: Vec<(String, String, Option<String>)> = vec![]; // (folder, key, version)
+    if owml_mods_dir.exists() {
+        if let Ok(entries) = fs::read_dir(&owml_mods_dir) {
+            for entry in entries.filter_map(|e| e.ok()) {
+                if entry.path().is_dir() && !is_ignored_mod_dir(&entry.path()) {
+                    let folder_name = entry.file_name().to_string_lossy().to_string();
+                    let mod_key = read_owml_unique_name(&entry.path())
+                        .unwrap_or_else(|| extract_mod_key(&folder_name));
+                    let version = read_owml_version(&entry.path())
+                        .or_else(|| extract_version_suffix(&folder_name));
+                    game_mod_folders.push((folder_name, mod_key, version));
+                }
+            }
+        }
+    }
+
+    // Build a set of ALL mod keys in the profile (enabled + disabled). OWML keeps mods
+    // physically present on disk and uses config.json to enable/disable them, so we must
+    // NOT remove a mod just because the user individually disabled it in the UI.
+    let owml_all_key_set: std::collections::HashSet<String> = {
+        let mut set = std::collections::HashSet::new();
+        if let Some(arr) = profile["mods"].as_array() {
+            for m in arr {
+                if let Some(full_name) = m["fullName"].as_str() {
+                    set.insert(extract_mod_key(full_name));
+                }
+            }
+        }
+        set
+    };
+
+    let mut to_remove: Vec<String> = Vec::new();
+    for (folder_name, gm_key, game_version) in &game_mod_folders {
+        // Use owml_all_key_set so disabled mods are NOT removed from disk.
+        if !owml_all_key_set.contains(gm_key) {
+            to_remove.push(folder_name.clone());
+            continue;
+        }
+
+        // Only check version replacement for mods that are ENABLED (and thus will be
+        // re-installed if out of date). Disabled mods stay at whatever version they have.
+        if !desired_key_set.contains(gm_key) {
+            continue;
+        }
+
+        let desired_version = desired_version_by_key.get(gm_key);
+        let needs_replacement = match desired_version {
+            Some(dv) => match game_version.as_ref() {
+                Some(gv) => gv != dv,
+                None => false,
+            },
+            None => false,
+        };
+        if needs_replacement {
+            to_remove.push(folder_name.clone());
+        }
+    }
+
+    let mut to_install: Vec<String> = desired_key_set
+        .iter()
+        .filter(|pm_key| {
+            // If this is the OWML loader itself, check if already installed
+            if pm_key.contains("owml") || pm_key.contains("outerwildsmodmanager") {
+                return !owml_installed;
+            }
+            if ignored_keys.contains(*pm_key) {
+                return false;
+            }
+
+            let desired_version = desired_version_by_key.get(*pm_key);
+
+            let has_exact_version = game_mod_folders.iter().any(|(_, gm_key, game_version)| {
+                if gm_key != *pm_key {
+                    return false;
+                }
+                if let Some(dv) = desired_version {
+                    if let Some(gv) = game_version {
+                        return gv == dv;
+                    }
+                    return false;
+                }
+                true
+            });
+
+            !has_exact_version
+        })
+        .map(|k| k.to_string())
+        .collect();
+    to_install.sort();
+
+    ensure_finalize_ready(finalize, to_install.len())?;
+
+    // Remove mods only after every desired payload has been installed.
+    if finalize {
+        apply_configs();
+    }
+    let mut removed = 0;
+    if finalize {
+        for folder_name in &to_remove {
+            let folder_path = owml_mods_dir.join(folder_name);
+            if folder_path.exists() {
+                let _ = fs::remove_dir_all(&folder_path);
+                removed += 1;
+            }
+        }
+    }
+
+    // Cache: copy installed mods to profile cache
+    let mut cached = 0;
+    if finalize && use_cache && owml_mods_dir.exists() {
+        if !profile_owml_cache.exists() {
+            let _ = fs::create_dir_all(&profile_owml_cache);
+        }
+        if let Ok(entries) = fs::read_dir(&owml_mods_dir) {
+            for entry in entries.filter_map(|e| e.ok()) {
+                if entry.path().is_dir() && !is_ignored_mod_dir(&entry.path()) {
+                    let folder_name = entry.file_name().to_string_lossy().to_string();
+                    let cache_path = profile_owml_cache.join(&folder_name);
+                    if !cache_path.exists() {
+                        if copy_dir_recursive(&entry.path(), &cache_path).is_ok() {
+                            cached += 1;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // OWML detects Wine via wine_get_version() and prepends "Z:" to gamePath/owmlPath.
+    // So these must be Unix-style paths relative to drive_c root: /Program Files/...
+    // NOT Windows-style C:\Program Files\ (which would become Z:C:\... = broken)
+    // Always use the canonical "OWML" path (not "OWML_DISABLED") in OWML.Config.json,
+    // because the folder will be restored to OWML/ before launch.
+    let game_wine_path = convert_to_owml_unix_path(game_path);
+    let owml_canonical_dir = game_path.join("OWML");
+    let owml_unix_path_raw = convert_to_owml_unix_path(&owml_canonical_dir);
+    let mut owml_wine_path = owml_unix_path_raw.clone();
+    if !owml_wine_path.ends_with('/') {
+        owml_wine_path.push('/');
+    }
+
+    // Write/update OWML.Config.json with socketPort=0 to prevent Wine socket crashes.
+    // This is done on every sync so the setting is always enforced.
+    if owml_dir.exists() {
+        let config_path = owml_dir.join("OWML.Config.json");
+        let mut config: serde_json::Value = if config_path.exists() {
+            fs::read_to_string(&config_path)
+                .ok()
+                .and_then(|s| serde_json::from_str(&s).ok())
+                .unwrap_or_else(|| serde_json::json!({}))
+        } else {
+            serde_json::json!({})
+        };
+
+        // Force socketPort=0 to prevent SocketListener from binding in Wine/CrossOver
+        config["socketPort"] = serde_json::json!(0);
+        config["incrementalGC"] = serde_json::json!(true);
+        config["gamePath"] = serde_json::json!(&game_wine_path);
+        config["owmlPath"] = serde_json::json!(&owml_wine_path);
+        if let Some(obj) = config.as_object_mut() {
+            obj.entry("forceExe").or_insert(serde_json::json!(false));
+            obj.entry("disableVersionPopup")
+                .or_insert(serde_json::json!(true));
+        }
+
+        if let Ok(serialized) = serde_json::to_string_pretty(&config) {
+            let _ = fs::write(&config_path, serialized);
+            log::debug!(
+                "[sync_profile_to_game] Wrote OWML.Config.json (socketPort=0) at {:?}",
+                config_path
+            );
+        }
+    }
+
+    // Also write/update the OWML.Config.json in OuterWilds_Data/Managed/ to make sure it points to our OWML folder!
+    let managed_dir = game_path.join("OuterWilds_Data").join("Managed");
+    if managed_dir.exists() {
+        let config_path = managed_dir.join("OWML.Config.json");
+        let mut config: serde_json::Value = if config_path.exists() {
+            fs::read_to_string(&config_path)
+                .ok()
+                .and_then(|s| serde_json::from_str(&s).ok())
+                .unwrap_or_else(|| serde_json::json!({}))
+        } else {
+            serde_json::json!({})
+        };
+
+        config["gamePath"] = serde_json::json!(&game_wine_path);
+        config["owmlPath"] = serde_json::json!(&owml_wine_path);
+        config["socketPort"] = serde_json::json!(0);
+        config["incrementalGC"] = serde_json::json!(true);
+        if let Some(obj) = config.as_object_mut() {
+            obj.entry("forceExe").or_insert(serde_json::json!(false));
+            obj.entry("disableVersionPopup")
+                .or_insert(serde_json::json!(true));
+        }
+
+        if let Ok(serialized) = serde_json::to_string_pretty(&config) {
+            let _ = fs::write(&config_path, serialized);
+            log::debug!(
+                "[sync_profile_to_game] Wrote Managed/OWML.Config.json at {:?}",
+                config_path
+            );
+        }
+    }
+
+    // Set mod enabled/disabled state in OWML mods configs
+    if owml_mods_dir.exists() {
+        if let Some(mods_arr) = profile["mods"].as_array() {
+            for m in mods_arr {
+                if let (Some(full_name), Some(is_enabled)) =
+                    (m["fullName"].as_str(), m["enabled"].as_bool())
+                {
+                    let mod_key = extract_mod_key(full_name);
+
+                    // Find installed folder for this mod_key
+                    let mut found_folder = None;
+                    if let Ok(entries) = fs::read_dir(&owml_mods_dir) {
+                        for entry in entries.filter_map(|e| e.ok()) {
+                            if entry.path().is_dir() && !is_ignored_mod_dir(&entry.path()) {
+                                let f_name = entry.file_name().to_string_lossy().to_string();
+                                let m_key = read_owml_unique_name(&entry.path())
+                                    .unwrap_or_else(|| extract_mod_key(&f_name));
+                                if m_key == mod_key {
+                                    found_folder = Some(f_name);
+                                    break;
+                                }
+                            }
+                        }
+                    }
+
+                    if let Some(folder) = found_folder {
+                        let mod_config_path = owml_mods_dir.join(&folder).join("config.json");
+
+                        let mut config: serde_json::Value = if mod_config_path.exists() {
+                            fs::read_to_string(&mod_config_path)
+                                .ok()
+                                .and_then(|s| serde_json::from_str(&s).ok())
+                                .unwrap_or_else(|| serde_json::json!({}))
+                        } else {
+                            // Fallback: try default-config.json first if config.json doesn't exist
+                            let def_config_path =
+                                owml_mods_dir.join(&folder).join("default-config.json");
+                            if def_config_path.exists() {
+                                fs::read_to_string(&def_config_path)
+                                    .ok()
+                                    .and_then(|s| serde_json::from_str(&s).ok())
+                                    .unwrap_or_else(|| serde_json::json!({}))
+                            } else {
+                                serde_json::json!({})
+                            }
+                        };
+
+                        config["enabled"] = serde_json::json!(is_enabled);
+
+                        if let Ok(serialized) = serde_json::to_string_pretty(&config) {
+                            let _ = fs::write(&mod_config_path, serialized);
+                            log::debug!(
+                                "[sync_profile_to_game] Set Outer Wilds mod {} enabled={}",
+                                folder,
+                                is_enabled
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Toggle vanilla mode via shared helpers (covers Assembly-CSharp + mscorlib)
+    if profile_is_vanilla {
+        let _ = restore_outerwilds_vanilla(&game_path);
+        let _ = restore_mscorlib_vanilla(&game_path, false);
+        if owml_folder.exists() {
+            if owml_disabled.exists() {
+                let _ = fs::remove_dir_all(&owml_disabled);
+            }
+            let _ = fs::rename(&owml_folder, &owml_disabled);
+            log::info!("[sync_profile_to_game] Renamed OWML -> OWML_DISABLED");
+        }
+    } else {
+        if owml_disabled.exists() && !owml_folder.exists() {
+            let _ = fs::rename(&owml_disabled, &owml_folder);
+            log::info!("[sync_profile_to_game] Restored OWML_DISABLED -> OWML");
+        }
+        let _ = restore_outerwilds_modded(&game_path);
+    }
+
+    if finalize {
+        capture_configs();
+    }
+
+    Ok(serde_json::json!({
+        "removed": removed,
+        "to_install": to_install,
+        "already_installed": game_mod_folders.len(),
+        "cached": cached,
+        "pending_removals": if finalize { 0 } else { to_remove.len() },
+        "needs_config_switch": !finalize && needs_config_switch
+    }))
+}
+
+/// What a scan of the game's plugins folder found, and which folders go.
+struct PluginFolderPlan {
+    /// Keys of the `.r2mmignore`-marked folders, which nothing touches.
+    ignored_keys: std::collections::HashSet<String>,
+    /// (folder name, `Author-ModName` key) of every unmarked folder with a payload.
+    game_mod_folders: Vec<(String, String)>,
+    to_remove: Vec<String>,
+}
+
+/// Scan a BepInEx plugins folder and decide what Apply removes from it.
+///
+/// Kept apart from `sync_profile_to_game` so it can run against a scratch
+/// folder: everything it reads arrives as an argument.
+fn plan_plugin_folders(
+    game_plugins: &std::path::Path,
+    desired_key_set: &std::collections::HashSet<String>,
+    desired_full_by_key: &std::collections::HashMap<String, String>,
+    desired_version_by_key: &std::collections::HashMap<String, String>,
+    manifests_to_keep: &[crate::utils::mod_manifest::StoredModOwnershipManifest],
+) -> PluginFolderPlan {
+    let extract_mod_key = sync_mod_key;
+    let extract_version_suffix = sync_version_suffix;
+
+    // 3. Scan game plugins folder for currently installed mods
+    // Store both the folder name AND the derived key
+    let ignored_keys = log_ignored_mod_folders(
+        game_plugins,
+        |name, _| extract_mod_key(name),
+        desired_key_set,
+    );
+    let mut game_mod_folders: Vec<(String, String)> = vec![]; // (folder_name, author-modname key)
+    let mut invalid_game_mod_folders: Vec<String> = vec![];
+    if game_plugins.exists() {
+        if let Ok(entries) = fs::read_dir(game_plugins) {
+            for entry in entries.filter_map(|e| e.ok()) {
+                if entry.path().is_dir() && !is_ignored_mod_dir(&entry.path()) {
+                    let folder_name = entry.file_name().to_string_lossy().to_string();
+                    let mod_key = extract_mod_key(&folder_name);
+                    if game_mod_folder_has_payload(
+                        game_plugins,
+                        &entry.path(),
+                        &folder_name,
+                        &mod_key,
+                    ) {
+                        game_mod_folders.push((folder_name, mod_key));
+                    } else {
+                        log::debug!(
+                            "[sync_profile_to_game] Detected broken/metadata-only mod folder: {}",
+                            folder_name
+                        );
+                        invalid_game_mod_folders.push(folder_name);
+                    }
+                }
+            }
+        }
+    }
+
+    log::warn!(
+        "[sync_profile_to_game] Game has {} valid mods installed ({} broken placeholders)",
+        game_mod_folders.len(),
+        invalid_game_mod_folders.len()
+    );
+
+    // 4. Calculate diff using Author-ModName key + version awareness.
+    // Remove entries not present in profile OR with a mismatched pinned version.
+    let mut to_remove: Vec<String> = invalid_game_mod_folders.clone();
+    for (folder_name, gm_key) in &game_mod_folders {
+        if !desired_key_set.contains(gm_key) {
+            // Check if this folder is owned by any manifest we want to keep
+            let folder_prefix_1 = format!("bepinex/plugins/{}/", folder_name.to_lowercase());
+            let folder_prefix_2 =
+                format!("bepinex_disabled/plugins/{}/", folder_name.to_lowercase());
+            let folder_exact_1 = format!("bepinex/plugins/{}", folder_name.to_lowercase());
+            let folder_exact_2 = format!("bepinex_disabled/plugins/{}", folder_name.to_lowercase());
+            let is_owned_by_kept_manifest = manifests_to_keep.iter().any(|entry| {
+                entry.manifest.files.iter().any(|file| {
+                    let file_lower = file.to_lowercase();
+                    file_lower.starts_with(&folder_prefix_1)
+                        || file_lower.starts_with(&folder_prefix_2)
+                        || file_lower == folder_exact_1
+                        || file_lower == folder_exact_2
+                })
+            });
+            if is_owned_by_kept_manifest {
+                log::debug!(
+                    "[sync_profile_to_game] Keeping folder owned by kept manifest: {}",
+                    folder_name
+                );
+                continue;
+            }
+
+            if game_mod_folder_is_auxiliary_payload(folder_name, gm_key, desired_full_by_key) {
+                log::debug!(
+                    "[sync_profile_to_game] Keeping auxiliary payload folder: {}",
+                    folder_name
+                );
+                continue;
+            }
+            to_remove.push(folder_name.clone());
+            continue;
+        }
+
+        let desired_version = desired_version_by_key.get(gm_key);
+        let desired_full = desired_full_by_key.get(gm_key);
+        let game_version = extract_version_suffix(folder_name)
+            .or_else(|| read_manifest_version(&game_plugins.join(folder_name)));
+        let full_mismatch = desired_full
+            .map(|full| folder_name.to_lowercase() != *full)
+            .unwrap_or(false);
+        let needs_replacement = match desired_version {
+            Some(dv) => match game_version.as_ref() {
+                Some(gv) => gv != dv,
+                None => full_mismatch,
+            },
+            None => false,
+        };
+
+        if needs_replacement && full_mismatch {
+            to_remove.push(folder_name.clone());
+        }
+    }
+
+    PluginFolderPlan {
+        ignored_keys,
+        game_mod_folders,
+        to_remove,
+    }
+}
 
 fn ensure_finalize_ready(finalize: bool, missing_payloads: usize) -> Result<(), String> {
     if finalize && missing_payloads > 0 {
@@ -481,23 +1206,8 @@ pub async fn sync_profile_to_game(
         validate_macos_bepinex_support(runtime_game_path)?;
     }
 
-    let extract_mod_key = |name: &str| -> String {
-        let parts: Vec<&str> = name.split('-').collect();
-        if parts.len() >= 2 {
-            format!("{}-{}", parts[0], parts[1]).to_lowercase()
-        } else {
-            name.to_lowercase()
-        }
-    };
-    let extract_version_suffix = |name: &str| -> Option<String> {
-        name.rsplit('-').next().and_then(|tail| {
-            if tail.contains('.') && tail.chars().all(|c| c.is_ascii_digit() || c == '.') {
-                Some(tail.to_lowercase())
-            } else {
-                None
-            }
-        })
-    };
+    let extract_mod_key = sync_mod_key;
+    let extract_version_suffix = sync_version_suffix;
 
     // Desired profile state indexed by key (Author-ModName).
     let mut desired_key_set: std::collections::HashSet<String> = std::collections::HashSet::new();
@@ -586,504 +1296,45 @@ pub async fn sync_profile_to_game(
 
     // --- Outer Wilds (OWML) sync branch ---
     if is_outerwilds_profile {
-        let owml_folder = game_path.join("OWML");
-        let owml_disabled = game_path.join("OWML_DISABLED");
-        if !profile_is_vanilla {
-            if owml_disabled.exists() && !owml_folder.exists() {
-                let _ = fs::rename(&owml_disabled, &owml_folder);
-                log::info!("[sync_profile_to_game] Restored OWML_DISABLED -> OWML");
-            }
-        }
-
-        // Resolve the actual OWML directory: it may be OWML or OWML_DISABLED depending on
-        // whether the profile is currently in vanilla mode. After the potential restore above
-        // (lines 150-154), OWML should be back if !profile_is_vanilla. For vanilla mode, the
-        // folder may still be at OWML_DISABLED from a previous sync, so we check both.
-        let owml_dir = if owml_folder.exists() {
-            owml_folder.clone()
-        } else if owml_disabled.exists() {
-            // OWML was previously disabled (vanilla mode). Use OWML_DISABLED as the working dir
-            // for reading mods and writing config.json so that individually-disabled mods are
-            // correctly updated even while the profile stays in vanilla mode.
-            owml_disabled.clone()
-        } else {
-            // Neither exists yet (fresh install). Default to OWML.
-            owml_folder.clone()
-        };
-        let owml_mods_dir = owml_dir.join("Mods");
-        let profile_owml_cache = profile_dir.join("OWML").join("Mods");
-
-        // Read manifest.json uniqueName from a mod folder to derive the mod key.
-        let read_owml_unique_name = |mod_dir: &std::path::Path| -> Option<String> {
-            let manifest_path = mod_dir.join("manifest.json");
-            if let Ok(data) = fs::read_to_string(&manifest_path) {
-                if let Ok(v) = serde_json::from_str::<serde_json::Value>(&data) {
-                    if let Some(unique_name) = v["uniqueName"].as_str() {
-                        // Convert dots to hyphens for Thunderstore key matching
-                        return Some(unique_name.replace('.', "-").to_lowercase());
-                    }
-                }
-            }
-            None
-        };
-
-        // Read installed version from a mod's manifest.json
-        let read_owml_version = |mod_dir: &std::path::Path| -> Option<String> {
-            let manifest_path = mod_dir.join("manifest.json");
-            if let Ok(data) = fs::read_to_string(&manifest_path) {
-                if let Ok(v) = serde_json::from_str::<serde_json::Value>(&data) {
-                    return v["version"].as_str().map(|s| s.to_string());
-                }
-            }
-            None
-        };
-
-        let owml_installed = owml_dir.join("OWML.Launcher.exe").exists();
-
-        // Scan installed mods
-        let mut game_mod_folders: Vec<(String, String, Option<String>)> = vec![]; // (folder, key, version)
-        if owml_mods_dir.exists() {
-            if let Ok(entries) = fs::read_dir(&owml_mods_dir) {
-                for entry in entries.filter_map(|e| e.ok()) {
-                    if entry.path().is_dir() {
-                        let folder_name = entry.file_name().to_string_lossy().to_string();
-                        let mod_key = read_owml_unique_name(&entry.path())
-                            .unwrap_or_else(|| extract_mod_key(&folder_name));
-                        let version = read_owml_version(&entry.path())
-                            .or_else(|| extract_version_suffix(&folder_name));
-                        game_mod_folders.push((folder_name, mod_key, version));
-                    }
-                }
-            }
-        }
-
-        // Build a set of ALL mod keys in the profile (enabled + disabled). OWML keeps mods
-        // physically present on disk and uses config.json to enable/disable them, so we must
-        // NOT remove a mod just because the user individually disabled it in the UI.
-        let owml_all_key_set: std::collections::HashSet<String> = {
-            let mut set = std::collections::HashSet::new();
-            if let Some(arr) = profile["mods"].as_array() {
-                for m in arr {
-                    if let Some(full_name) = m["fullName"].as_str() {
-                        set.insert(extract_mod_key(full_name));
-                    }
-                }
-            }
-            set
-        };
-
-        let mut to_remove: Vec<String> = Vec::new();
-        for (folder_name, gm_key, game_version) in &game_mod_folders {
-            // Use owml_all_key_set so disabled mods are NOT removed from disk.
-            if !owml_all_key_set.contains(gm_key) {
-                to_remove.push(folder_name.clone());
-                continue;
-            }
-
-            // Only check version replacement for mods that are ENABLED (and thus will be
-            // re-installed if out of date). Disabled mods stay at whatever version they have.
-            if !desired_key_set.contains(gm_key) {
-                continue;
-            }
-
-            let desired_version = desired_version_by_key.get(gm_key);
-            let needs_replacement = match desired_version {
-                Some(dv) => match game_version.as_ref() {
-                    Some(gv) => gv != dv,
-                    None => false,
-                },
-                None => false,
-            };
-            if needs_replacement {
-                to_remove.push(folder_name.clone());
-            }
-        }
-
-        let mut to_install: Vec<String> = desired_key_set
-            .iter()
-            .filter(|pm_key| {
-                // If this is the OWML loader itself, check if already installed
-                if pm_key.contains("owml") || pm_key.contains("outerwildsmodmanager") {
-                    return !owml_installed;
-                }
-
-                let desired_version = desired_version_by_key.get(*pm_key);
-
-                let has_exact_version = game_mod_folders.iter().any(|(_, gm_key, game_version)| {
-                    if gm_key != *pm_key {
-                        return false;
-                    }
-                    if let Some(dv) = desired_version {
-                        if let Some(gv) = game_version {
-                            return gv == dv;
-                        }
-                        return false;
-                    }
-                    true
-                });
-
-                !has_exact_version
-            })
-            .map(|k| k.to_string())
-            .collect();
-        to_install.sort();
-
-        ensure_finalize_ready(finalize, to_install.len())?;
-
-        // Remove mods only after every desired payload has been installed.
-        if finalize {
-            apply_configs();
-        }
-        let mut removed = 0;
-        if finalize {
-            for folder_name in &to_remove {
-                let folder_path = owml_mods_dir.join(folder_name);
-                if folder_path.exists() {
-                    let _ = fs::remove_dir_all(&folder_path);
-                    removed += 1;
-                }
-            }
-        }
-
-        // Cache: copy installed mods to profile cache
-        let mut cached = 0;
-        if finalize && use_cache && owml_mods_dir.exists() {
-            if !profile_owml_cache.exists() {
-                let _ = fs::create_dir_all(&profile_owml_cache);
-            }
-            if let Ok(entries) = fs::read_dir(&owml_mods_dir) {
-                for entry in entries.filter_map(|e| e.ok()) {
-                    if entry.path().is_dir() {
-                        let folder_name = entry.file_name().to_string_lossy().to_string();
-                        let cache_path = profile_owml_cache.join(&folder_name);
-                        if !cache_path.exists() {
-                            if copy_dir_recursive(&entry.path(), &cache_path).is_ok() {
-                                cached += 1;
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        // OWML detects Wine via wine_get_version() and prepends "Z:" to gamePath/owmlPath.
-        // So these must be Unix-style paths relative to drive_c root: /Program Files/...
-        // NOT Windows-style C:\Program Files\ (which would become Z:C:\... = broken)
-        // Always use the canonical "OWML" path (not "OWML_DISABLED") in OWML.Config.json,
-        // because the folder will be restored to OWML/ before launch.
-        let game_wine_path = convert_to_owml_unix_path(game_path);
-        let owml_canonical_dir = game_path.join("OWML");
-        let owml_unix_path_raw = convert_to_owml_unix_path(&owml_canonical_dir);
-        let mut owml_wine_path = owml_unix_path_raw.clone();
-        if !owml_wine_path.ends_with('/') {
-            owml_wine_path.push('/');
-        }
-
-        // Write/update OWML.Config.json with socketPort=0 to prevent Wine socket crashes.
-        // This is done on every sync so the setting is always enforced.
-        if owml_dir.exists() {
-            let config_path = owml_dir.join("OWML.Config.json");
-            let mut config: serde_json::Value = if config_path.exists() {
-                fs::read_to_string(&config_path)
-                    .ok()
-                    .and_then(|s| serde_json::from_str(&s).ok())
-                    .unwrap_or_else(|| serde_json::json!({}))
-            } else {
-                serde_json::json!({})
-            };
-
-            // Force socketPort=0 to prevent SocketListener from binding in Wine/CrossOver
-            config["socketPort"] = serde_json::json!(0);
-            config["incrementalGC"] = serde_json::json!(true);
-            config["gamePath"] = serde_json::json!(&game_wine_path);
-            config["owmlPath"] = serde_json::json!(&owml_wine_path);
-            if let Some(obj) = config.as_object_mut() {
-                obj.entry("forceExe").or_insert(serde_json::json!(false));
-                obj.entry("disableVersionPopup")
-                    .or_insert(serde_json::json!(true));
-            }
-
-            if let Ok(serialized) = serde_json::to_string_pretty(&config) {
-                let _ = fs::write(&config_path, serialized);
-                log::debug!(
-                    "[sync_profile_to_game] Wrote OWML.Config.json (socketPort=0) at {:?}",
-                    config_path
+        return sync_outerwilds_mods(
+            game_path,
+            profile,
+            &profile_dir,
+            profile_is_vanilla,
+            &desired_key_set,
+            &desired_version_by_key,
+            finalize,
+            use_cache,
+            needs_config_switch,
+            apply_configs,
+            || {
+                crate::utils::config_backup::capture_profile_configs(
+                    &app_data_dir,
+                    &profile_id,
+                    game_path,
+                    &bepinex_root,
+                    &game_identifier,
                 );
-            }
-        }
-
-        // Also write/update the OWML.Config.json in OuterWilds_Data/Managed/ to make sure it points to our OWML folder!
-        let managed_dir = game_path.join("OuterWilds_Data").join("Managed");
-        if managed_dir.exists() {
-            let config_path = managed_dir.join("OWML.Config.json");
-            let mut config: serde_json::Value = if config_path.exists() {
-                fs::read_to_string(&config_path)
-                    .ok()
-                    .and_then(|s| serde_json::from_str(&s).ok())
-                    .unwrap_or_else(|| serde_json::json!({}))
-            } else {
-                serde_json::json!({})
-            };
-
-            config["gamePath"] = serde_json::json!(&game_wine_path);
-            config["owmlPath"] = serde_json::json!(&owml_wine_path);
-            config["socketPort"] = serde_json::json!(0);
-            config["incrementalGC"] = serde_json::json!(true);
-            if let Some(obj) = config.as_object_mut() {
-                obj.entry("forceExe").or_insert(serde_json::json!(false));
-                obj.entry("disableVersionPopup")
-                    .or_insert(serde_json::json!(true));
-            }
-
-            if let Ok(serialized) = serde_json::to_string_pretty(&config) {
-                let _ = fs::write(&config_path, serialized);
-                log::debug!(
-                    "[sync_profile_to_game] Wrote Managed/OWML.Config.json at {:?}",
-                    config_path
-                );
-            }
-        }
-
-        // Set mod enabled/disabled state in OWML mods configs
-        if owml_mods_dir.exists() {
-            if let Some(mods_arr) = profile["mods"].as_array() {
-                for m in mods_arr {
-                    if let (Some(full_name), Some(is_enabled)) =
-                        (m["fullName"].as_str(), m["enabled"].as_bool())
-                    {
-                        let mod_key = extract_mod_key(full_name);
-
-                        // Find installed folder for this mod_key
-                        let mut found_folder = None;
-                        if let Ok(entries) = fs::read_dir(&owml_mods_dir) {
-                            for entry in entries.filter_map(|e| e.ok()) {
-                                if entry.path().is_dir() {
-                                    let f_name = entry.file_name().to_string_lossy().to_string();
-                                    let m_key = read_owml_unique_name(&entry.path())
-                                        .unwrap_or_else(|| extract_mod_key(&f_name));
-                                    if m_key == mod_key {
-                                        found_folder = Some(f_name);
-                                        break;
-                                    }
-                                }
-                            }
-                        }
-
-                        if let Some(folder) = found_folder {
-                            let mod_config_path = owml_mods_dir.join(&folder).join("config.json");
-
-                            let mut config: serde_json::Value = if mod_config_path.exists() {
-                                fs::read_to_string(&mod_config_path)
-                                    .ok()
-                                    .and_then(|s| serde_json::from_str(&s).ok())
-                                    .unwrap_or_else(|| serde_json::json!({}))
-                            } else {
-                                // Fallback: try default-config.json first if config.json doesn't exist
-                                let def_config_path =
-                                    owml_mods_dir.join(&folder).join("default-config.json");
-                                if def_config_path.exists() {
-                                    fs::read_to_string(&def_config_path)
-                                        .ok()
-                                        .and_then(|s| serde_json::from_str(&s).ok())
-                                        .unwrap_or_else(|| serde_json::json!({}))
-                                } else {
-                                    serde_json::json!({})
-                                }
-                            };
-
-                            config["enabled"] = serde_json::json!(is_enabled);
-
-                            if let Ok(serialized) = serde_json::to_string_pretty(&config) {
-                                let _ = fs::write(&mod_config_path, serialized);
-                                log::debug!(
-                                    "[sync_profile_to_game] Set Outer Wilds mod {} enabled={}",
-                                    folder,
-                                    is_enabled
-                                );
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        // Toggle vanilla mode via shared helpers (covers Assembly-CSharp + mscorlib)
-        if profile_is_vanilla {
-            let _ = restore_outerwilds_vanilla(&game_path);
-            let _ = restore_mscorlib_vanilla(&game_path, false);
-            if owml_folder.exists() {
-                if owml_disabled.exists() {
-                    let _ = fs::remove_dir_all(&owml_disabled);
-                }
-                let _ = fs::rename(&owml_folder, &owml_disabled);
-                log::info!("[sync_profile_to_game] Renamed OWML -> OWML_DISABLED");
-            }
-        } else {
-            if owml_disabled.exists() && !owml_folder.exists() {
-                let _ = fs::rename(&owml_disabled, &owml_folder);
-                log::info!("[sync_profile_to_game] Restored OWML_DISABLED -> OWML");
-            }
-            let _ = restore_outerwilds_modded(&game_path);
-        }
-
-        if finalize {
-            crate::utils::config_backup::capture_profile_configs(
-                &app_data_dir,
-                &profile_id,
-                game_path,
-                &bepinex_root,
-                &game_identifier,
-            );
-        }
-
-        return Ok(serde_json::json!({
-            "removed": removed,
-            "to_install": to_install,
-            "already_installed": game_mod_folders.len(),
-            "cached": cached,
-            "pending_removals": if finalize { 0 } else { to_remove.len() },
-            "needs_config_switch": !finalize && needs_config_switch
-        }));
+            },
+        );
     }
 
     if is_balatro_profile {
         let mods_root = get_balatro_mods_dir().ok_or_else(|| {
             "Could not resolve ~/Library/Application Support/Balatro/Mods".to_string()
         })?;
-        let profile_mods_cache = profile_dir.join("Balatro").join("Mods");
-
-        let mut game_mod_folders: Vec<(String, String, Option<String>)> = vec![];
-        if mods_root.exists() {
-            if let Ok(entries) = fs::read_dir(&mods_root) {
-                for entry in entries.filter_map(|e| e.ok()) {
-                    if entry.path().is_dir() {
-                        let folder_name = entry.file_name().to_string_lossy().to_string();
-                        let mod_key = if folder_name.eq_ignore_ascii_case("smods") {
-                            "steamopollys-steamodded".to_string()
-                        } else {
-                            extract_mod_key(&folder_name)
-                        };
-                        let version = extract_version_suffix(&folder_name)
-                            .or_else(|| read_manifest_version(&entry.path()));
-                        game_mod_folders.push((folder_name, mod_key, version));
-                    }
-                }
-            }
-        }
-
-        let lovely_installed = has_balatro_lovely_runtime(game_path);
-
-        let mut to_remove: Vec<String> = Vec::new();
-        for (folder_name, gm_key, game_version) in &game_mod_folders {
-            if !desired_key_set.contains(gm_key) {
-                to_remove.push(folder_name.clone());
-                continue;
-            }
-
-            let desired_version = desired_version_by_key.get(gm_key);
-            let desired_full = desired_full_by_key.get(gm_key);
-            let full_mismatch = desired_full
-                .map(|full| {
-                    folder_name.to_lowercase() != *full
-                        && !folder_name.eq_ignore_ascii_case("smods")
-                })
-                .unwrap_or(false);
-            let needs_replacement = match desired_version {
-                Some(dv) => match game_version.as_ref() {
-                    Some(gv) => gv != dv,
-                    None => full_mismatch,
-                },
-                None => false,
-            };
-
-            if needs_replacement && full_mismatch {
-                to_remove.push(folder_name.clone());
-            }
-        }
-
-        let mut to_install: Vec<String> = desired_key_set
-            .iter()
-            .filter(|pm_key| {
-                if *pm_key == "thunderstore-lovely" {
-                    return !lovely_installed;
-                }
-
-                let desired_full = desired_full_by_key
-                    .get(*pm_key)
-                    .cloned()
-                    .unwrap_or_default();
-                let desired_version = desired_version_by_key.get(*pm_key);
-
-                let has_exact_version =
-                    game_mod_folders
-                        .iter()
-                        .any(|(folder_name, gm_key, game_version)| {
-                            if gm_key != *pm_key {
-                                return false;
-                            }
-
-                            if let Some(dv) = desired_version {
-                                if let Some(gv) = game_version {
-                                    return gv == dv;
-                                }
-                                if folder_name.eq_ignore_ascii_case("smods") {
-                                    return true;
-                                }
-                                return folder_name.to_lowercase() == desired_full;
-                            }
-
-                            true
-                        });
-
-                !has_exact_version
-            })
-            .map(|k| k.to_string())
-            .collect();
-        to_install.sort();
-
-        ensure_finalize_ready(finalize, to_install.len())?;
-
-        let mut removed = 0;
-        if finalize {
-            apply_configs();
-            for folder_name in &to_remove {
-                let folder_path = mods_root.join(folder_name);
-                if folder_path.exists() {
-                    let _ = fs::remove_dir_all(&folder_path);
-                    removed += 1;
-                }
-            }
-        }
-
-        let mut cached = 0;
-        if finalize && use_cache && mods_root.exists() {
-            if !profile_mods_cache.exists() {
-                let _ = fs::create_dir_all(&profile_mods_cache);
-            }
-
-            if let Ok(entries) = fs::read_dir(&mods_root) {
-                for entry in entries.filter_map(|e| e.ok()) {
-                    if entry.path().is_dir() {
-                        let folder_name = entry.file_name().to_string_lossy().to_string();
-                        let cache_path = profile_mods_cache.join(&folder_name);
-                        if !cache_path.exists() {
-                            if copy_dir_recursive(&entry.path(), &cache_path).is_ok() {
-                                cached += 1;
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        return Ok(serde_json::json!({
-            "removed": removed,
-            "to_install": to_install,
-            "already_installed": game_mod_folders.len(),
-            "cached": cached,
-            "pending_removals": if finalize { 0 } else { to_remove.len() },
-            "needs_config_switch": !finalize && needs_config_switch
-        }));
+        return sync_balatro_mods(
+            &mods_root,
+            &profile_dir.join("Balatro").join("Mods"),
+            has_balatro_lovely_runtime(game_path),
+            &desired_key_set,
+            &desired_full_by_key,
+            &desired_version_by_key,
+            finalize,
+            use_cache,
+            needs_config_switch,
+            apply_configs,
+        );
     }
 
     // ReturnOfModding keeps disabled plugins on disk, but it does not read the
@@ -1453,99 +1704,18 @@ pub async fn sync_profile_to_game(
         .iter()
         .map(|entry| entry.manifest.mod_key.clone())
         .collect::<std::collections::HashSet<_>>();
-    // 3. Scan game plugins folder for currently installed mods
-    // Store both the folder name AND the derived key
-    let mut game_mod_folders: Vec<(String, String)> = vec![]; // (folder_name, author-modname key)
-    let mut invalid_game_mod_folders: Vec<String> = vec![];
-    if game_plugins.exists() {
-        if let Ok(entries) = fs::read_dir(&game_plugins) {
-            for entry in entries.filter_map(|e| e.ok()) {
-                if entry.path().is_dir() {
-                    let folder_name = entry.file_name().to_string_lossy().to_string();
-                    let mod_key = extract_mod_key(&folder_name);
-                    if game_mod_folder_has_payload(
-                        &game_plugins,
-                        &entry.path(),
-                        &folder_name,
-                        &mod_key,
-                    ) {
-                        game_mod_folders.push((folder_name, mod_key));
-                    } else {
-                        log::debug!(
-                            "[sync_profile_to_game] Detected broken/metadata-only mod folder: {}",
-                            folder_name
-                        );
-                        invalid_game_mod_folders.push(folder_name);
-                    }
-                }
-            }
-        }
-    }
-
-    log::warn!(
-        "[sync_profile_to_game] Game has {} valid mods installed ({} broken placeholders)",
-        game_mod_folders.len(),
-        invalid_game_mod_folders.len()
+    // 3-4. Scan the game's plugins and work out which folders go.
+    let PluginFolderPlan {
+        ignored_keys,
+        game_mod_folders,
+        to_remove,
+    } = plan_plugin_folders(
+        &game_plugins,
+        &desired_key_set,
+        &desired_full_by_key,
+        &desired_version_by_key,
+        &manifests_to_keep,
     );
-
-    // 4. Calculate diff using Author-ModName key + version awareness.
-    // Remove entries not present in profile OR with a mismatched pinned version.
-    let mut to_remove: Vec<String> = invalid_game_mod_folders.clone();
-    for (folder_name, gm_key) in &game_mod_folders {
-        if !desired_key_set.contains(gm_key) {
-            // Check if this folder is owned by any manifest we want to keep
-            let folder_prefix_1 = format!("bepinex/plugins/{}/", folder_name.to_lowercase());
-            let folder_prefix_2 =
-                format!("bepinex_disabled/plugins/{}/", folder_name.to_lowercase());
-            let folder_exact_1 = format!("bepinex/plugins/{}", folder_name.to_lowercase());
-            let folder_exact_2 = format!("bepinex_disabled/plugins/{}", folder_name.to_lowercase());
-            let is_owned_by_kept_manifest = manifests_to_keep.iter().any(|entry| {
-                entry.manifest.files.iter().any(|file| {
-                    let file_lower = file.to_lowercase();
-                    file_lower.starts_with(&folder_prefix_1)
-                        || file_lower.starts_with(&folder_prefix_2)
-                        || file_lower == folder_exact_1
-                        || file_lower == folder_exact_2
-                })
-            });
-            if is_owned_by_kept_manifest {
-                log::debug!(
-                    "[sync_profile_to_game] Keeping folder owned by kept manifest: {}",
-                    folder_name
-                );
-                continue;
-            }
-
-            if game_mod_folder_is_auxiliary_payload(folder_name, gm_key, &desired_full_by_key) {
-                log::debug!(
-                    "[sync_profile_to_game] Keeping auxiliary payload folder: {}",
-                    folder_name
-                );
-                continue;
-            }
-            to_remove.push(folder_name.clone());
-            continue;
-        }
-
-        let desired_version = desired_version_by_key.get(gm_key);
-        let desired_full = desired_full_by_key.get(gm_key);
-        let game_version = extract_version_suffix(folder_name)
-            .or_else(|| read_manifest_version(&game_plugins.join(folder_name)));
-        let full_mismatch = desired_full
-            .map(|full| folder_name.to_lowercase() != *full)
-            .unwrap_or(false);
-        let needs_replacement = match desired_version {
-            Some(dv) => match game_version.as_ref() {
-                Some(gv) => gv != dv,
-                None => full_mismatch,
-            },
-            None => false,
-        };
-
-        if needs_replacement && full_mismatch {
-            to_remove.push(folder_name.clone());
-        }
-    }
 
     // to_install: any profile key not present at the desired version in game
     // Special case: BepInExPack installs to game root, not plugins - check if BepInEx folder exists
@@ -1592,6 +1762,9 @@ pub async fn sync_profile_to_game(
                     incoming_manifest_present,
                     runtime_identity_required,
                 );
+            }
+            if ignored_keys.contains(*pm_key) {
+                return false;
             }
 
             // A folder with the same name/version is not proof of the same
@@ -1745,7 +1918,7 @@ pub async fn sync_profile_to_game(
         // Iterate game mods and copy to cache if not present
         if let Ok(entries) = fs::read_dir(&game_plugins) {
             for entry in entries.filter_map(|e| e.ok()) {
-                if entry.path().is_dir() {
+                if entry.path().is_dir() && !is_ignored_mod_dir(&entry.path()) {
                     let folder_name = entry.file_name().to_string_lossy().to_string();
                     let cache_path = profile_plugins.join(&folder_name);
 
@@ -2591,5 +2764,265 @@ mod isolation_migration_tests {
         assert!(!profile.join("BepInEx/plugins/Author-Other-1.0.0").exists());
 
         std::fs::remove_dir_all(root).unwrap();
+    }
+}
+
+/// Issue #54: Apply, profile switches and a published copy of the same mod
+/// must leave a `.r2mmignore`-marked mod folder exactly as its author left it.
+/// Each test builds a scratch game, runs the real reconciliation the way the
+/// interface does (preflight, install what it asks for, finalize) and checks
+/// what is left on disk.
+#[cfg(test)]
+mod r2mmignore_simulation_tests {
+    use super::*;
+    use crate::utils::mod_ignore::IGNORE_MARKER;
+    use std::collections::{HashMap, HashSet};
+    use std::path::{Path, PathBuf};
+
+    struct Desired {
+        keys: HashSet<String>,
+        full: HashMap<String, String>,
+        version: HashMap<String, String>,
+    }
+
+    /// The desired state `sync_profile_to_game` derives from a profile's mods.
+    fn desired(full_names: &[&str]) -> Desired {
+        let mut desired = Desired {
+            keys: HashSet::new(),
+            full: HashMap::new(),
+            version: HashMap::new(),
+        };
+        for full_name in full_names {
+            let key = sync_mod_key(full_name);
+            desired.keys.insert(key.clone());
+            desired.full.insert(key.clone(), full_name.to_lowercase());
+            if let Some(version) = sync_version_suffix(full_name) {
+                desired.version.insert(key, version);
+            }
+        }
+        desired
+    }
+
+    fn scratch(label: &str) -> PathBuf {
+        let root = std::env::temp_dir().join(format!(
+            "r2modmac-r2mmignore-sim-{label}-{}",
+            uuid::Uuid::new_v4()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        root
+    }
+
+    fn mod_folder(root: &Path, name: &str, file: &str, contents: &[u8]) -> PathBuf {
+        let dir = root.join(name);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join(file), contents).unwrap();
+        dir
+    }
+
+    fn mark(dir: &Path) {
+        fs::write(dir.join(IGNORE_MARKER), b"").unwrap();
+    }
+
+    fn balatro_apply(
+        mods_root: &Path,
+        cache: &Path,
+        want: &Desired,
+        finalize: bool,
+    ) -> serde_json::Value {
+        sync_balatro_mods(
+            mods_root,
+            cache,
+            true,
+            &want.keys,
+            &want.full,
+            &want.version,
+            finalize,
+            true,
+            false,
+            || {},
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn balatro_apply_and_profile_switch_leave_the_marked_mod_alone() {
+        let root = scratch("balatro");
+        let mods = root.join("Mods");
+        let wip = mod_folder(&mods, "MiaMod", "main.lua", b"work in progress");
+        mark(&wip);
+        mod_folder(&mods, "Old-Mod-1.0.0", "main.lua", b"old");
+        mod_folder(&mods, "Keep-Mod-1.0.0", "main.lua", b"keep");
+
+        // My profile: only Keep-Mod. Preflight reports Old-Mod, not MiaMod.
+        let mine = desired(&["Keep-Mod-1.0.0"]);
+        let cache_a = root.join("profile-a/Balatro/Mods");
+        let plan = balatro_apply(&mods, &cache_a, &mine, false);
+        assert_eq!(plan["pending_removals"], 1);
+        assert_eq!(plan["to_install"], serde_json::json!([]));
+        balatro_apply(&mods, &cache_a, &mine, true);
+        assert!(!mods.join("Old-Mod-1.0.0").exists());
+        assert!(mods.join("Keep-Mod-1.0.0").is_dir());
+        assert_eq!(fs::read(wip.join("main.lua")).unwrap(), b"work in progress");
+        assert!(cache_a.join("Keep-Mod-1.0.0").is_dir());
+        assert!(
+            !cache_a.join("MiaMod").exists(),
+            "the work is not copied into the profile"
+        );
+
+        // Friends' profile: a different mod. Install it the way the UI would,
+        // then finalize: Keep-Mod goes, MiaMod stays.
+        let friends = desired(&["Friend-Mod-2.0.0"]);
+        let cache_b = root.join("profile-b/Balatro/Mods");
+        let plan = balatro_apply(&mods, &cache_b, &friends, false);
+        assert_eq!(plan["to_install"], serde_json::json!(["friend-mod"]));
+        mod_folder(&mods, "Friend-Mod-2.0.0", "main.lua", b"friend");
+        balatro_apply(&mods, &cache_b, &friends, true);
+        assert!(!mods.join("Keep-Mod-1.0.0").exists());
+        assert!(mods.join("Friend-Mod-2.0.0").is_dir());
+        assert_eq!(fs::read(wip.join("main.lua")).unwrap(), b"work in progress");
+
+        // An empty profile still leaves it.
+        balatro_apply(&mods, &cache_b, &desired(&[]), true);
+        assert!(!mods.join("Friend-Mod-2.0.0").exists());
+        assert_eq!(fs::read(wip.join("main.lua")).unwrap(), b"work in progress");
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn balatro_without_the_marker_still_removes_the_folder() {
+        // The control: proves the tests above would fail if the marker did nothing.
+        let root = scratch("balatro-control");
+        let mods = root.join("Mods");
+        mod_folder(&mods, "MiaMod", "main.lua", b"work in progress");
+        balatro_apply(&mods, &root.join("cache"), &desired(&[]), true);
+        assert!(!mods.join("MiaMod").exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn balatro_published_copy_of_the_same_mod_is_not_installed_over_it() {
+        let root = scratch("balatro-conflict");
+        let mods = root.join("Mods");
+        let wip = mod_folder(&mods, "Me-MiaMod-dev", "main.lua", b"newer than release");
+        mark(&wip);
+
+        let wants_release = desired(&["Me-MiaMod-1.0.0"]);
+        let plan = balatro_apply(&mods, &root.join("cache"), &wants_release, false);
+        assert_eq!(plan["to_install"], serde_json::json!([]));
+        assert_eq!(plan["pending_removals"], 0);
+        balatro_apply(&mods, &root.join("cache"), &wants_release, true);
+        assert_eq!(
+            fs::read(wip.join("main.lua")).unwrap(),
+            b"newer than release"
+        );
+        assert!(!mods.join("Me-MiaMod-1.0.0").exists());
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    fn owml_mod(mods: &Path, folder: &str, unique_name: &str) -> PathBuf {
+        let dir = mod_folder(mods, folder, "Mod.dll", b"payload");
+        fs::write(
+            dir.join("manifest.json"),
+            serde_json::json!({ "uniqueName": unique_name, "version": "1.0.0" }).to_string(),
+        )
+        .unwrap();
+        dir
+    }
+
+    fn owml_apply(
+        game: &Path,
+        profile_dir: &Path,
+        mods: &[&str],
+        finalize: bool,
+    ) -> serde_json::Value {
+        let profile = serde_json::json!({
+            "mods": mods
+                .iter()
+                .map(|name| serde_json::json!({ "fullName": name, "enabled": true }))
+                .collect::<Vec<_>>()
+        });
+        let want = desired(mods);
+        sync_outerwilds_mods(
+            game,
+            &profile,
+            profile_dir,
+            false,
+            &want.keys,
+            &want.version,
+            finalize,
+            true,
+            false,
+            || {},
+            || {},
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn owml_apply_leaves_the_marked_mod_alone_and_untouched() {
+        let root = scratch("owml");
+        let game = root.join("game");
+        let mods = game.join("OWML/Mods");
+        let wip = owml_mod(&mods, "Me.MyMod", "Me.MyMod");
+        mark(&wip);
+        owml_mod(&mods, "Old.Mod", "Old.Mod");
+        let profile_dir = root.join("profile");
+
+        let plan = owml_apply(&game, &profile_dir, &[], false);
+        assert_eq!(plan["pending_removals"], 1);
+        owml_apply(&game, &profile_dir, &[], true);
+        assert!(!mods.join("Old.Mod").exists());
+        assert!(wip.join("Mod.dll").is_file());
+        assert!(!profile_dir.join("OWML/Mods/Me.MyMod").exists());
+
+        // A profile asking for the published copy: not installed, and the
+        // enabled flag is not written into the author's folder either.
+        let plan = owml_apply(&game, &profile_dir, &["Me-MyMod-1.0.0"], false);
+        assert_eq!(plan["to_install"], serde_json::json!([]));
+        owml_apply(&game, &profile_dir, &["Me-MyMod-1.0.0"], true);
+        assert!(wip.join("Mod.dll").is_file());
+        assert!(!wip.join("config.json").exists());
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn bepinex_plan_never_removes_a_marked_plugin_folder() {
+        let root = scratch("bepinex");
+        let plugins = root.join("BepInEx/plugins");
+        let wip = mod_folder(&plugins, "Me-Wip", "Wip.dll", b"work in progress");
+        mark(&wip);
+        mod_folder(&plugins, "Old-Mod-1.0.0", "Old.dll", b"old");
+
+        let plan = plan_plugin_folders(
+            &plugins,
+            &desired(&[]).keys,
+            &HashMap::new(),
+            &HashMap::new(),
+            &[],
+        );
+        assert_eq!(plan.to_remove, vec!["Old-Mod-1.0.0".to_string()]);
+        assert!(plan
+            .game_mod_folders
+            .iter()
+            .all(|(name, _)| name != "Me-Wip"));
+        assert!(plan.ignored_keys.contains("me-wip"));
+
+        // The published copy is asked for: the marked folder stands in for it,
+        // which is what keeps it out of to_install.
+        let wants_release = desired(&["Me-Wip-1.0.0"]);
+        let plan = plan_plugin_folders(
+            &plugins,
+            &wants_release.keys,
+            &wants_release.full,
+            &wants_release.version,
+            &[],
+        );
+        assert!(plan.ignored_keys.contains("me-wip"));
+        assert!(!plan.to_remove.contains(&"Me-Wip".to_string()));
+
+        fs::remove_dir_all(root).unwrap();
     }
 }

@@ -1284,6 +1284,55 @@ fn balatro_target_folder_name(mod_name: &str) -> String {
     }
 }
 
+/// The key a Balatro mods folder answers to, matching the sync's reading.
+fn balatro_folder_key(folder_name: &str) -> String {
+    if folder_name.eq_ignore_ascii_case("smods") {
+        "steamopollys-steamodded".to_string()
+    } else {
+        extract_mod_key(folder_name)
+    }
+}
+
+/// The `.r2mmignore`-marked folder among `folders` that stands in for
+/// `mod_name`, so an install would land on or beside the author's work.
+fn ignored_stand_in(
+    folders: Vec<(String, std::path::PathBuf)>,
+    mod_name: &str,
+    key_of: impl Fn(&str, &std::path::Path) -> String,
+) -> Option<String> {
+    let key = extract_mod_key(mod_name);
+    folders
+        .into_iter()
+        .find(|(name, path)| key_of(name, path) == key)
+        .map(|(name, _)| name)
+}
+
+/// The install result for a mod a marked folder stands in for: nothing is
+/// written, and the profile treats the folder as that mod.
+fn skipped_for_ignored_folder(mod_name: &str, folder: &str) -> serde_json::Value {
+    log::warn!(
+        "[install_mod] Not installing {}: {} carries .r2mmignore",
+        mod_name,
+        folder
+    );
+    serde_json::json!({ "success": true, "skipped": true, "ignoredFolder": folder })
+}
+
+/// The OWML key of a mods folder: its manifest's `uniqueName`, as the sync reads it.
+fn owml_folder_key(folder_name: &str, path: &std::path::Path) -> String {
+    fs::read(path.join("manifest.json"))
+        .ok()
+        .and_then(|data| {
+            crate::utils::manifest_json::parse_manifest_bytes(&data, "OWML mod folder").ok()
+        })
+        .and_then(|manifest| {
+            manifest["uniqueName"]
+                .as_str()
+                .map(|unique| unique.replace('.', "-").to_lowercase())
+        })
+        .unwrap_or_else(|| extract_mod_key(folder_name))
+}
+
 /// Whether this package is the ReturnOfModding loader itself.
 ///
 /// More than one package ships the loader: Risk of Rain Returns installs
@@ -4758,6 +4807,16 @@ async fn install_mod_bytes(
         });
 
         let mod_dir = owml_root.join("Mods").join(&mod_folder_name);
+        if crate::utils::mod_ignore::is_ignored_mod_dir(&mod_dir) {
+            return Ok(skipped_for_ignored_folder(&mod_name, &mod_folder_name));
+        }
+        if let Some(folder) = ignored_stand_in(
+            crate::utils::mod_ignore::ignored_mod_folders(&owml_root.join("Mods")),
+            &mod_name,
+            owml_folder_key,
+        ) {
+            return Ok(skipped_for_ignored_folder(&mod_name, &folder));
+        }
         if mod_dir.exists() {
             let _ = fs::remove_dir_all(&mod_dir);
         }
@@ -4888,6 +4947,13 @@ async fn install_mod_bytes(
         let mods_root = get_balatro_mods_dir().ok_or_else(|| {
             "Could not resolve ~/Library/Application Support/Balatro/Mods".to_string()
         })?;
+        if let Some(folder) = ignored_stand_in(
+            crate::utils::mod_ignore::ignored_mod_folders(&mods_root),
+            &mod_name,
+            |name, _| balatro_folder_key(name),
+        ) {
+            return Ok(skipped_for_ignored_folder(&mod_name, &folder));
+        }
         fs::create_dir_all(&mods_root).map_err(|e| e.to_string())?;
 
         let target_folder = balatro_target_folder_name(&mod_name);
@@ -5033,6 +5099,23 @@ async fn install_mod_bytes(
         } else {
             GAME_MANIFEST_SCOPE
         };
+        if !is_bepinex_pack {
+            let landing_in_marked = managed_files.iter().find_map(|file| {
+                let relative = file.to_string_lossy().replace('\\', "/");
+                crate::utils::mod_ignore::is_in_ignored_plugin_folder(&bepinex_root, &relative)
+                    .then_some(relative)
+            });
+            let stand_in = landing_in_marked.or_else(|| {
+                ignored_stand_in(
+                    crate::utils::mod_ignore::ignored_plugin_folders(&bepinex_root),
+                    &mod_name,
+                    |name, _| extract_mod_key(name),
+                )
+            });
+            if let Some(folder) = stand_in {
+                return Ok(skipped_for_ignored_folder(&mod_name, &folder));
+            }
+        }
         let backed_up_files = if managed_files.is_empty() {
             Vec::new()
         } else {
@@ -5630,6 +5713,13 @@ pub async fn toggle_mod(
                     copy_dir_recursive(&profile_mod_path, &game_mod_path)
                         .map_err(|e| format!("Failed to sync mod to game: {}", e))?;
                 }
+            } else if crate::utils::mod_ignore::is_ignored_mod_dir(&game_mod_path)
+                && !game_mod_path.is_symlink()
+            {
+                log::info!(
+                    "[toggle_mod] Leaving {} in the game: it carries .r2mmignore",
+                    folder_name
+                );
             } else {
                 // Remove mod from game folder (keep in cache)
                 if game_mod_path.exists() || game_mod_path.is_symlink() {
@@ -5713,6 +5803,9 @@ pub async fn copy_mod_from_cache(
             let target_folder = balatro_target_folder_name(&mod_name);
             let src_path = profile_mods_dir.join(&target_folder);
             let dst_path = game_mods_dir.join(&target_folder);
+            if crate::utils::mod_ignore::is_ignored_mod_dir(&dst_path) {
+                return Ok(skipped_for_ignored_folder(&mod_name, &target_folder));
+            }
             if src_path.exists() {
                 if dst_path.exists() {
                     let _ = fs::remove_dir_all(&dst_path);
@@ -5816,6 +5909,9 @@ pub async fn copy_mod_from_cache(
         if let Some(folder) = found_folder {
             let src_path = profile_mods_dir.join(&folder);
             let dst_path = game_mods_dir.join(&folder);
+            if crate::utils::mod_ignore::is_ignored_mod_dir(&dst_path) {
+                return Ok(skipped_for_ignored_folder(&mod_name, &folder));
+            }
             if src_path.exists() {
                 if dst_path.exists() {
                     let _ = fs::remove_dir_all(&dst_path);
@@ -5854,7 +5950,7 @@ pub async fn copy_mod_from_cache(
                 let dst = game_dir.join(dest_name);
                 if src.exists() {
                     if dst.exists() {
-                        let _ = fs::remove_dir_all(&dst);
+                        let _ = crate::utils::mod_ignore::remove_dir_all_keeping_ignored(&dst);
                     }
                     copy_dir_recursive(&src, &dst).map_err(|e| e.to_string())?;
                 }
@@ -5933,6 +6029,9 @@ pub async fn copy_mod_from_cache(
             {
                 let src_path = entry.path();
                 let dst_path = game_plugins_dir.join(&folder_name);
+                if crate::utils::mod_ignore::is_ignored_mod_dir(&dst_path) {
+                    return Ok(skipped_for_ignored_folder(&mod_name, &folder_name));
+                }
 
                 if src_path.is_dir() {
                     log::debug!(
@@ -9945,5 +10044,90 @@ mod provider_filter_tests {
         assert!(package_matches_providers(&outer_wilds, &only("hexium")));
         let bare = package(&[], &[]);
         assert!(package_matches_providers(&bare, &only("hexium")));
+    }
+}
+
+/// Issue #54: an install a `.r2mmignore`-marked folder stands in for is skipped.
+#[cfg(test)]
+mod r2mmignore_install_tests {
+    use super::{balatro_folder_key, extract_mod_key, ignored_stand_in, owml_folder_key};
+    use crate::utils::mod_ignore::{ignored_mod_folders, ignored_plugin_folders, IGNORE_MARKER};
+    use std::fs;
+    use std::path::Path;
+
+    fn scratch(label: &str) -> std::path::PathBuf {
+        let root = std::env::temp_dir().join(format!(
+            "r2modmac-r2mmignore-install-{label}-{}",
+            uuid::Uuid::new_v4()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        root
+    }
+
+    fn marked(dir: &Path) {
+        fs::create_dir_all(dir).unwrap();
+        fs::write(dir.join(IGNORE_MARKER), b"").unwrap();
+    }
+
+    #[test]
+    fn balatro_install_finds_the_marked_folder_for_the_same_mod() {
+        let root = scratch("balatro");
+        marked(&root.join("Me-MiaMod-dev"));
+        marked(&root.join("smods"));
+        fs::create_dir_all(root.join("Me-Other-1.0.0")).unwrap();
+
+        let stand_in = |mod_name: &str| {
+            ignored_stand_in(ignored_mod_folders(&root), mod_name, |name, _| {
+                balatro_folder_key(name)
+            })
+        };
+        assert_eq!(
+            stand_in("Me-MiaMod-1.2.0"),
+            Some("Me-MiaMod-dev".to_string())
+        );
+        assert_eq!(
+            stand_in("Steamopollys-Steamodded-1.0.0"),
+            Some("smods".to_string())
+        );
+        assert_eq!(
+            stand_in("Me-Other-1.0.0"),
+            None,
+            "unmarked folders do not block"
+        );
+        assert_eq!(stand_in("Someone-Else-1.0.0"), None);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn owml_install_matches_by_unique_name() {
+        let root = scratch("owml");
+        let wip = root.join("WorkFolder");
+        marked(&wip);
+        fs::write(wip.join("manifest.json"), br#"{"uniqueName":"Me.MyMod"}"#).unwrap();
+
+        let found = ignored_stand_in(
+            ignored_mod_folders(&root),
+            "Me-MyMod-1.0.0",
+            owml_folder_key,
+        );
+        assert_eq!(found, Some("WorkFolder".to_string()));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn bepinex_install_sees_marked_folders_in_live_and_disabled_trees() {
+        let root = scratch("bepinex");
+        marked(&root.join("BepInEx/plugins/Me-Wip"));
+        marked(&root.join("BepInEx_DISABLED/plugins/Me-Off"));
+
+        let stand_in = |mod_name: &str| {
+            ignored_stand_in(ignored_plugin_folders(&root), mod_name, |name, _| {
+                extract_mod_key(name)
+            })
+        };
+        assert_eq!(stand_in("Me-Wip-1.0.0"), Some("Me-Wip".to_string()));
+        assert_eq!(stand_in("Me-Off-2.0.0"), Some("Me-Off".to_string()));
+        assert_eq!(stand_in("Me-New-1.0.0"), None);
+        fs::remove_dir_all(root).unwrap();
     }
 }

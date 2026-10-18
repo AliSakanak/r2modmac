@@ -5,6 +5,7 @@ pub mod file_ops;
 pub mod legacy_persistent_download;
 pub mod log_privacy;
 pub mod manifest_json;
+pub mod mod_ignore;
 pub mod mod_manifest;
 pub mod paths;
 #[path = "secure_persistent_download.rs"]

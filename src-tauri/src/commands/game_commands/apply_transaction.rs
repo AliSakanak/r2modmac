@@ -315,16 +315,50 @@ fn copy_target_with_progress(
     Ok(())
 }
 
-fn remove_target(target: &std::path::Path) -> Result<(), String> {
+/// Remove a target, keeping the `.r2mmignore`-marked mod folders inside it.
+/// Returns whether any were kept.
+fn remove_target(target: &std::path::Path) -> Result<bool, String> {
     if target.is_symlink() {
-        fs::remove_file(target).map_err(|error| error.to_string())
+        fs::remove_file(target).map_err(|error| error.to_string())?;
+        Ok(false)
     } else if target.is_dir() {
-        fs::remove_dir_all(target).map_err(|error| error.to_string())
+        crate::utils::mod_ignore::remove_dir_all_keeping_ignored(target)
+            .map_err(|error| error.to_string())
     } else if target.exists() || target.is_symlink() {
-        fs::remove_file(target).map_err(|error| error.to_string())
+        fs::remove_file(target).map_err(|error| error.to_string())?;
+        Ok(false)
     } else {
-        Ok(())
+        Ok(false)
     }
+}
+
+/// Put a snapshot back around the marked folders a rollback kept: an Apply
+/// never writes into them, so the live copy is the author's latest work and
+/// the snapshot's older copy must not land on top of it.
+fn restore_around_ignored(
+    source: &std::path::Path,
+    destination: &std::path::Path,
+) -> Result<(), String> {
+    if crate::utils::mod_ignore::is_ignored_mod_dir(destination) && !destination.is_symlink() {
+        return Ok(());
+    }
+    if source.is_symlink() {
+        if !(destination.exists() || destination.is_symlink()) {
+            copy_symlink(source, destination)?;
+        }
+    } else if source.is_dir() {
+        fs::create_dir_all(destination).map_err(|error| error.to_string())?;
+        for entry in fs::read_dir(source).map_err(|error| error.to_string())? {
+            let entry = entry.map_err(|error| error.to_string())?;
+            restore_around_ignored(&entry.path(), &destination.join(entry.file_name()))?;
+        }
+    } else if source.is_file() {
+        if let Some(parent) = destination.parent() {
+            fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+        }
+        fs::copy(source, destination).map_err(|error| error.to_string())?;
+    }
+    Ok(())
 }
 
 /// Config files under `target` that the snapshot never saw, as (path, bytes).
@@ -391,8 +425,10 @@ fn restore_snapshot(
             );
         }
 
-        remove_target(target)?;
-        if backup.exists() || backup.is_symlink() {
+        let kept_ignored = remove_target(target)?;
+        if kept_ignored && backup.is_dir() && !backup.is_symlink() {
+            restore_around_ignored(&backup, target)?;
+        } else if backup.exists() || backup.is_symlink() {
             copy_target(&backup, target)?;
         }
 
@@ -674,6 +710,40 @@ mod tests {
 
         assert_eq!(fs::read(target.join("mod.dll")).unwrap(), b"old");
         assert!(!target.join("new-only.dll").exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_rollback_leaves_marked_mod_folders_as_the_author_left_them() {
+        let root = std::env::temp_dir().join(format!(
+            "r2modmac-apply-transaction-r2mmignore-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let target = root.join("Mods");
+        let backup = root.join("backup");
+        let wip = target.join("MyMod");
+        fs::create_dir_all(&wip).unwrap();
+        fs::write(wip.join(crate::utils::mod_ignore::IGNORE_MARKER), b"").unwrap();
+        fs::write(wip.join("main.lua"), b"before apply").unwrap();
+        fs::create_dir_all(target.join("Other")).unwrap();
+        fs::write(target.join("Other/mod.lua"), b"old").unwrap();
+        copy_target(&target, &backup.join(backup_name(0))).unwrap();
+
+        fs::write(wip.join("main.lua"), b"edited during apply").unwrap();
+        fs::write(target.join("Other/mod.lua"), b"partial-new").unwrap();
+        fs::create_dir_all(target.join("Half")).unwrap();
+        restore_snapshot(&backup, &[target.clone()]).unwrap();
+
+        assert_eq!(
+            fs::read(wip.join("main.lua")).unwrap(),
+            b"edited during apply"
+        );
+        assert_eq!(fs::read(target.join("Other/mod.lua")).unwrap(), b"old");
+        assert!(!target.join("Half").exists());
         fs::remove_dir_all(root).unwrap();
     }
 

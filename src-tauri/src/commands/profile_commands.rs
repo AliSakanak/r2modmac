@@ -7,6 +7,7 @@ use crate::models::shared::{
     is_outerwilds_identifier, AppState,
 };
 use crate::utils::file_ops::*;
+use crate::utils::mod_ignore::remove_dir_all_keeping_ignored;
 use std::fs;
 use std::io::Write;
 use std::path::{Component, Path, PathBuf};
@@ -235,6 +236,36 @@ fn safe_profile_dir_name(raw: &str) -> Result<String, String> {
     }
 }
 
+/// Clear Balatro's mods folders when its last profile goes, keeping any
+/// `.r2mmignore`-marked mod a developer is working on in place.
+fn remove_balatro_mods_dirs(mods_dir: &Path) {
+    let disabled_dir = mods_dir
+        .parent()
+        .map(|p| p.join("Mods_DISABLED"))
+        .unwrap_or_else(|| mods_dir.join("Mods_DISABLED"));
+    for dir_path in [mods_dir.to_path_buf(), disabled_dir] {
+        if dir_path.exists() {
+            log::debug!("[delete_profile] Removing Balatro mods dir {:?}", dir_path);
+            let _ = remove_dir_all_keeping_ignored(&dir_path);
+        }
+    }
+}
+
+/// Remove OWML and OWML_DISABLED from the game, keeping any marked mods
+/// inside them. Returns whether either was there.
+fn remove_owml_dirs(game_path: &Path) -> bool {
+    let mut removed = false;
+    for name in ["OWML", "OWML_DISABLED"] {
+        let dir = game_path.join(name);
+        if dir.exists() {
+            log::debug!("[delete_profile] Removing {} folder from game", name);
+            let _ = remove_dir_all_keeping_ignored(&dir);
+            removed = true;
+        }
+    }
+    removed
+}
+
 #[command]
 pub async fn delete_profile_folder(
     app: AppHandle,
@@ -282,7 +313,7 @@ pub async fn delete_profile_folder(
             let bepinex_path = game_path.join("BepInEx");
             if bepinex_path.exists() {
                 log::debug!("[delete_profile] Removing BepInEx folder from game");
-                let _ = fs::remove_dir_all(&bepinex_path);
+                let _ = remove_dir_all_keeping_ignored(&bepinex_path);
                 removed_runtime_artifact = true;
             }
 
@@ -340,19 +371,9 @@ pub async fn delete_profile_folder(
                     }
                 }
 
-                // 2. Remove OWML folder (the whole mod runtime, not just Mods/).
-                let owml_dir = game_path.join("OWML");
-                if owml_dir.exists() {
-                    log::debug!("[delete_profile] Removing OWML folder from game");
-                    let _ = fs::remove_dir_all(&owml_dir);
-                    removed_runtime_artifact = true;
-                }
-
-                // 3. Also remove OWML_DISABLED if it was left from a vanilla launch.
-                let owml_disabled_dir = game_path.join("OWML_DISABLED");
-                if owml_disabled_dir.exists() {
-                    log::debug!("[delete_profile] Removing OWML_DISABLED folder from game");
-                    let _ = fs::remove_dir_all(&owml_disabled_dir);
+                // 2-3. Remove OWML (the whole mod runtime, not just Mods/), and
+                // OWML_DISABLED if it was left from a vanilla launch.
+                if remove_owml_dirs(game_path) {
                     removed_runtime_artifact = true;
                 }
 
@@ -377,7 +398,7 @@ pub async fn delete_profile_folder(
                     let dir_path = game_path.join(dir_name);
                     if dir_path.exists() {
                         log::debug!("[delete_profile] Removing {} from game", dir_name);
-                        let _ = fs::remove_dir_all(&dir_path);
+                        let _ = remove_dir_all_keeping_ignored(&dir_path);
                         removed_runtime_artifact = true;
                     }
                 }
@@ -436,19 +457,7 @@ pub async fn delete_profile_folder(
                     }
 
                     if let Some(mods_dir) = get_balatro_mods_dir() {
-                        let disabled_dir = mods_dir
-                            .parent()
-                            .map(|p| p.join("Mods_DISABLED"))
-                            .unwrap_or_else(|| mods_dir.join("Mods_DISABLED"));
-                        for dir_path in [mods_dir.clone(), disabled_dir] {
-                            if dir_path.exists() {
-                                log::debug!(
-                                    "[delete_profile] Removing Balatro mods dir {:?}",
-                                    dir_path
-                                );
-                                let _ = fs::remove_dir_all(&dir_path);
-                            }
-                        }
+                        remove_balatro_mods_dirs(&mods_dir);
                     }
                 }
             }
@@ -1357,5 +1366,75 @@ mod duplicate_profile_claim_tests {
 
         assert!(profile.exists(), "no claim to clear is not an error");
         fs::remove_dir_all(&profile).ok();
+    }
+}
+
+/// Issue #54: deleting the last profile clears the game's mods, but not a
+/// `.r2mmignore`-marked mod someone is working on.
+#[cfg(test)]
+mod r2mmignore_delete_tests {
+    use super::{remove_balatro_mods_dirs, remove_owml_dirs};
+    use crate::utils::mod_ignore::IGNORE_MARKER;
+    use std::fs;
+    use std::path::Path;
+
+    fn scratch(label: &str) -> std::path::PathBuf {
+        let root = std::env::temp_dir().join(format!(
+            "r2modmac-r2mmignore-delete-{label}-{}",
+            uuid::Uuid::new_v4()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        root
+    }
+
+    fn marked_mod(dir: &Path) {
+        fs::create_dir_all(dir).unwrap();
+        fs::write(dir.join("main.lua"), b"work in progress").unwrap();
+        fs::write(dir.join(IGNORE_MARKER), b"").unwrap();
+    }
+
+    #[test]
+    fn deleting_the_last_balatro_profile_keeps_marked_mods() {
+        let root = scratch("balatro");
+        let mods = root.join("Mods");
+        marked_mod(&mods.join("MiaMod"));
+        marked_mod(&root.join("Mods_DISABLED/AltraMia"));
+        fs::create_dir_all(mods.join("Managed-Mod-1.0.0")).unwrap();
+        fs::create_dir_all(root.join("Mods_DISABLED/Managed-Off-1.0.0")).unwrap();
+
+        remove_balatro_mods_dirs(&mods);
+
+        assert_eq!(
+            fs::read(mods.join("MiaMod/main.lua")).unwrap(),
+            b"work in progress"
+        );
+        assert!(root.join("Mods_DISABLED/AltraMia/main.lua").is_file());
+        assert!(!mods.join("Managed-Mod-1.0.0").exists());
+        assert!(!root.join("Mods_DISABLED/Managed-Off-1.0.0").exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn deleting_the_last_balatro_profile_still_clears_unmarked_mods() {
+        let root = scratch("balatro-control");
+        let mods = root.join("Mods");
+        fs::create_dir_all(mods.join("MiaMod")).unwrap();
+        remove_balatro_mods_dirs(&mods);
+        assert!(!mods.exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn deleting_the_last_outer_wilds_profile_keeps_marked_mods() {
+        let root = scratch("owml");
+        marked_mod(&root.join("OWML/Mods/Me.MyMod"));
+        fs::write(root.join("OWML/OWML.Launcher.exe"), b"loader").unwrap();
+        fs::create_dir_all(root.join("OWML_DISABLED/Mods/Old.Mod")).unwrap();
+
+        assert!(remove_owml_dirs(&root));
+        assert!(root.join("OWML/Mods/Me.MyMod/main.lua").is_file());
+        assert!(!root.join("OWML/OWML.Launcher.exe").exists());
+        assert!(!root.join("OWML_DISABLED").exists());
+        fs::remove_dir_all(root).unwrap();
     }
 }
