@@ -1,31 +1,36 @@
 use super::super::owml_patcher;
 use super::super::*;
 
-/// How long a just-started game is watched for dying before it is up.
-const EARLY_EXIT_WINDOW_MS: u64 = 3_000;
+/// How long a just-started Balatro is watched before it counts as up. With
+/// mods, Lovely and Steamodded take a couple of seconds before the game's own
+/// `love.load` asks Steam for a session.
+const EARLY_EXIT_WINDOW_MS: u64 = 10_000;
 
-/// A game that dies while dyld is still loading it — a missing
-/// liblovely.dylib, say — never shows up as a process, and the launch then
-/// waited a full minute for it with the stop button lit. Say so instead.
-fn fail_if_exited_at_once(child: &mut std::process::Child) -> Result<(), String> {
-    let deadline =
-        std::time::Instant::now() + std::time::Duration::from_millis(EARLY_EXIT_WINDOW_MS);
+/// How long to wait for a Steam that r2modmac just opened to sign in.
+const STEAM_SIGN_IN_WAIT_MS: u64 = 90_000;
+
+/// What a just-started game did in its first seconds.
+#[derive(Debug, PartialEq, Eq)]
+enum EarlyExit {
+    StillRunning,
+    /// Exited normally. Balatro does this when Steam is not ready: its
+    /// `love.load` quits as soon as `luasteam:init()` fails.
+    Quit,
+    /// Died, e.g. dyld could not load liblovely.dylib.
+    Failed(String),
+}
+
+fn watch_early_exit(child: &mut std::process::Child, window_ms: u64) -> EarlyExit {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(window_ms);
     while std::time::Instant::now() < deadline {
         match child.try_wait() {
-            Ok(Some(status)) if !status.success() => {
-                log::warn!(
-                    "[launch_game_with_mods] The game exited right after starting: {}",
-                    status
-                );
-                return Err(format!(
-                    "The game closed as soon as it started ({status}). Apply the profile again so the mod loader is in place, then launch again."
-                ));
-            }
-            Ok(Some(_)) | Err(_) => return Ok(()),
+            Ok(Some(status)) if status.success() => return EarlyExit::Quit,
+            Ok(Some(status)) => return EarlyExit::Failed(status.to_string()),
             Ok(None) => std::thread::sleep(std::time::Duration::from_millis(100)),
+            Err(_) => return EarlyExit::StillRunning,
         }
     }
-    Ok(())
+    EarlyExit::StillRunning
 }
 
 /// How long to wait for BepInEx to announce itself after the game is up.
@@ -202,26 +207,71 @@ pub(crate) async fn launch_game_with_mods_for_macos(
         let lovely = game_path.join("liblovely.dylib");
         let direct = executable_path
             .as_ref()
-            .filter(|executable| executable.is_file() && lovely.is_file());
-        if let Some(executable) = direct {
-            log::info!(
-                "[launch_game_with_mods] Starting {} with Lovely from {}",
-                executable.display(),
-                lovely.display()
-            );
-            let mut child = std::process::Command::new(executable)
-                .env("DYLD_INSERT_LIBRARIES", &lovely)
-                .current_dir(game_path)
-                .spawn()
-                .map_err(|e| format!("Failed to launch Balatro with Lovely: {}", e))?;
-            fail_if_exited_at_once(&mut child)?;
-        } else {
-            let mut child = std::process::Command::new("/bin/sh")
-                .arg(&run_script)
-                .current_dir(game_path)
-                .spawn()
-                .map_err(|e| format!("Failed to launch run_lovely_macos.sh: {}", e))?;
-            fail_if_exited_at_once(&mut child)?;
+            .filter(|executable| executable.is_file() && lovely.is_file())
+            .cloned();
+        let spawn_game = || -> Result<std::process::Child, String> {
+            match direct.as_ref() {
+                Some(executable) => {
+                    log::info!(
+                        "[launch_game_with_mods] Starting {} with Lovely from {}",
+                        executable.display(),
+                        lovely.display()
+                    );
+                    std::process::Command::new(executable)
+                        .env("DYLD_INSERT_LIBRARIES", &lovely)
+                        .current_dir(game_path)
+                        .spawn()
+                        .map_err(|e| format!("Failed to launch Balatro with Lovely: {}", e))
+                }
+                None => std::process::Command::new("/bin/sh")
+                    .arg(&run_script)
+                    .current_dir(game_path)
+                    .spawn()
+                    .map_err(|e| format!("Failed to launch run_lovely_macos.sh: {}", e)),
+            }
+        };
+
+        // Balatro only runs inside a Steam session: its love.load quits the
+        // moment luasteam cannot reach Steam. The other games get Steam up
+        // through the steam://run path; this one is started directly, so it
+        // opens Steam the same way first and waits for Steam to finish signing
+        // in, then starts the game once.
+        if get_profile_distribution(app, profile_id) != "manual" {
+            let marks = steam_connection_log_marks(app);
+            if !ensure_macos_steam_running_for_launch(app) {
+                let waiting_since = std::time::Instant::now();
+                while !steam_logged_on_since(&marks) {
+                    super::super::launch_cancel::ensure_not_cancelled()?;
+                    if waiting_since.elapsed().as_millis() >= u128::from(STEAM_SIGN_IN_WAIT_MS) {
+                        log::warn!("[launch_game_with_mods] Steam did not report signing in; starting Balatro anyway");
+                        break;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(250));
+                }
+                log::info!(
+                    "[launch_game_with_mods] Steam ready after {} ms",
+                    waiting_since.elapsed().as_millis()
+                );
+            }
+        }
+
+        let mut child = spawn_game()?;
+        match watch_early_exit(&mut child, EARLY_EXIT_WINDOW_MS) {
+            EarlyExit::StillRunning => {}
+            EarlyExit::Failed(status) => {
+                log::warn!(
+                    "[launch_game_with_mods] Balatro died right after starting: {}",
+                    status
+                );
+                return Err(format!(
+                    "The game closed as soon as it started ({status}). Apply the profile again so the mod loader is in place, then launch again."
+                ));
+            }
+            EarlyExit::Quit => {
+                return Err(
+                    "Balatro closed right after starting. On macOS it only runs while Steam is open and signed in: open Steam, sign in, then launch again.".to_string(),
+                );
+            }
         }
 
         if let Some(executable_path) = executable_path.as_ref() {
@@ -696,15 +746,25 @@ mod bepinex_takeover_signal_tests {
     }
 
     #[test]
-    fn a_game_that_dies_at_once_is_reported_instead_of_awaited() {
+    fn early_exits_tell_a_steam_quit_from_a_crash() {
+        use super::{watch_early_exit, EarlyExit};
         let mut crashed = std::process::Command::new("/bin/sh")
             .args(["-c", "exit 134"])
             .spawn()
             .unwrap();
-        let error = super::fail_if_exited_at_once(&mut crashed).unwrap_err();
-        assert!(error.contains("closed as soon as it started"), "{error}");
+        assert!(matches!(
+            watch_early_exit(&mut crashed, 3_000),
+            EarlyExit::Failed(_)
+        ));
 
-        let mut clean = std::process::Command::new("/usr/bin/true").spawn().unwrap();
-        assert!(super::fail_if_exited_at_once(&mut clean).is_ok());
+        let mut quit = std::process::Command::new("/usr/bin/true").spawn().unwrap();
+        assert_eq!(watch_early_exit(&mut quit, 3_000), EarlyExit::Quit);
+
+        let mut running = std::process::Command::new("/bin/sleep")
+            .arg("2")
+            .spawn()
+            .unwrap();
+        assert_eq!(watch_early_exit(&mut running, 300), EarlyExit::StillRunning);
+        let _ = running.kill();
     }
 }

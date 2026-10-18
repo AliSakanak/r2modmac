@@ -197,6 +197,39 @@ pub(crate) fn relaunch_macos_steam_if_needed(_steam_root: &std::path::Path) {
 #[cfg(not(target_os = "macos"))]
 pub(crate) fn relaunch_macos_steam_if_needed(_steam_root: &std::path::Path) {}
 
+/// Where Steam's connection log ends right now, for each Steam root, so a
+/// later wait reads only what Steam writes after this moment.
+pub(crate) fn steam_connection_log_marks(app: &AppHandle) -> Vec<(std::path::PathBuf, u64)> {
+    get_steam_roots_for_platform(app, false)
+        .into_iter()
+        .map(|root| root.join("logs").join("connection_log.txt"))
+        .map(|log| {
+            let length = std::fs::metadata(&log).map(|meta| meta.len()).unwrap_or(0);
+            (log, length)
+        })
+        .collect()
+}
+
+/// Whether Steam has written that it finished signing in since `marks`.
+/// Steam logs `[Logged On, …] … processing complete` once the session is up,
+/// which is what a game started outside Steam needs before `SteamAPI_Init`.
+pub(crate) fn steam_logged_on_since(marks: &[(std::path::PathBuf, u64)]) -> bool {
+    marks.iter().any(|(log, mark)| {
+        let Ok(content) = std::fs::read(log) else {
+            return false;
+        };
+        // A log rotated away since the mark starts again from the top.
+        let from = if (content.len() as u64) < *mark {
+            0
+        } else {
+            *mark as usize
+        };
+        String::from_utf8_lossy(&content[from..])
+            .lines()
+            .any(|line| line.contains("[Logged On") && line.contains("processing complete"))
+    })
+}
+
 #[cfg(target_os = "macos")]
 /// Makes sure Steam is up before we ask it to run a game.
 ///
@@ -301,4 +334,36 @@ pub(crate) fn ensure_macos_steam_running_for_launch(app: &AppHandle) -> bool {
 #[cfg(not(target_os = "macos"))]
 pub(crate) fn ensure_macos_steam_running_for_launch(_app: &AppHandle) -> bool {
     false
+}
+
+#[cfg(test)]
+mod steam_sign_in_tests {
+    use super::steam_logged_on_since;
+
+    #[test]
+    fn only_a_sign_in_written_after_the_mark_counts() {
+        let dir = std::env::temp_dir().join(format!("r2modmac-steam-log-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let log = dir.join("connection_log.txt");
+        let earlier = "[2026-10-18 10:00:00] [Logged On, 4, 7] [U:1:1] RecvMsgClientLogOnResponse() : processing complete\n";
+        std::fs::write(&log, earlier).unwrap();
+        let marks = vec![(log.clone(), earlier.len() as u64)];
+        assert!(
+            !steam_logged_on_since(&marks),
+            "yesterday's sign-in is not today's"
+        );
+
+        let connecting = "[2026-10-18 16:57:36] [Logging On, 4, 7] [U:1:1] RecvMsgClientLogOnResponse() : [U:1:1] 'OK'\n";
+        std::fs::write(&log, format!("{earlier}{connecting}")).unwrap();
+        assert!(!steam_logged_on_since(&marks), "still signing in");
+
+        let done = "[2026-10-18 16:57:36] [Logged On, 4, 7] [U:1:1] RecvMsgClientLogOnResponse() : processing complete\n";
+        std::fs::write(&log, format!("{earlier}{connecting}{done}")).unwrap();
+        assert!(steam_logged_on_since(&marks));
+
+        // Rotated: the new log is shorter than the mark and is read from the top.
+        std::fs::write(&log, "[Logged On] processing complete\n").unwrap();
+        assert!(steam_logged_on_since(&marks));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 }
