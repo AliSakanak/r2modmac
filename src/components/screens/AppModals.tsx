@@ -103,6 +103,7 @@ export function AppModals({
                     isOpen={!!selectedMod}
                     gameId={selectedCommunity || ''}
                     installedMods={activeProfileId ? profiles.find(p => p.id === activeProfileId)?.mods || [] : []}
+                    modFolders={activeProfileId ? profiles.find(p => p.id === activeProfileId)?.modFolders : undefined}
                     onClose={() => setSelectedMod(null)}
                     onInstall={(version) => {
                         if (activeProfileId) {

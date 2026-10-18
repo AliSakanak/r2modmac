@@ -1318,6 +1318,22 @@ fn skipped_for_ignored_folder(mod_name: &str, folder: &str) -> serde_json::Value
     serde_json::json!({ "success": true, "skipped": true, "ignoredFolder": folder })
 }
 
+/// A mod leaving the Ignore folder is installed where its link was. Take the
+/// link away first, so the install writes into the game and never through the
+/// link into the mod's source folder.
+fn unlink_before_install(target: &std::path::Path) -> Result<(), String> {
+    if crate::utils::mod_ignore::is_dir_link(target) {
+        crate::utils::mod_ignore::remove_dir_link(target).map_err(|error| {
+            format!("Could not remove the link at {}: {error}", target.display())
+        })?;
+        log::info!(
+            "[install_mod] Replaced the link at {} with an install",
+            target.display()
+        );
+    }
+    Ok(())
+}
+
 /// The OWML key of a mods folder: its manifest's `uniqueName`, as the sync reads it.
 fn owml_folder_key(folder_name: &str, path: &std::path::Path) -> String {
     fs::read(path.join("manifest.json"))
@@ -3385,6 +3401,138 @@ pub async fn install_local_mod(
     .await
 }
 
+/// The folder name a linked custom mod takes in the game's mods folder: the
+/// same name an ordinary install of it would use, so Apply recognises it.
+fn linked_mod_folder_name(
+    game_identifier: &str,
+    game_root: &std::path::Path,
+    mod_name: &str,
+    source: &std::path::Path,
+) -> String {
+    if crate::models::shared::is_balatro_identifier(game_identifier)
+        || is_balatro_game_path(game_root)
+    {
+        return balatro_target_folder_name(mod_name);
+    }
+    if crate::models::shared::is_outerwilds_identifier(game_identifier)
+        || crate::models::shared::is_outerwilds_game_path(game_root)
+    {
+        return fs::read(source.join("manifest.json"))
+            .ok()
+            .and_then(|data| {
+                crate::utils::manifest_json::parse_manifest_bytes(&data, "OWML mod folder").ok()
+            })
+            .and_then(|manifest| manifest["uniqueName"].as_str().map(str::to_string))
+            .unwrap_or_else(|| mod_name.split('-').nth(1).unwrap_or(mod_name).to_string());
+    }
+    if crate::models::loaders::uses_return_of_modding(game_identifier, game_root) {
+        return return_of_modding_folder_name(mod_name);
+    }
+    mod_name.to_string()
+}
+
+/// Put `link` in place, pointing at `source`. An older link is replaced; a
+/// real folder is replaced only when it is this mod's own earlier install,
+/// never when it carries `.r2mmignore`.
+fn replace_with_dir_link(source: &std::path::Path, link: &std::path::Path) -> Result<(), String> {
+    use crate::utils::mod_ignore::{
+        create_dir_link, is_dir_link, is_ignored_mod_dir, remove_dir_link,
+    };
+    if is_dir_link(link) {
+        remove_dir_link(link).map_err(|error| {
+            format!("Could not replace the link at {}: {error}", link.display())
+        })?;
+    } else if link.exists() {
+        if is_ignored_mod_dir(link) {
+            return Err(format!(
+                "{} carries .r2mmignore; remove the marker or the folder before linking the mod there",
+                link.display()
+            ));
+        }
+        // Moving an installed custom mod into the Ignore folder leaves its
+        // copied files at exactly this path, under the name r2modmac gave them.
+        fs::remove_dir_all(link)
+            .map_err(|error| format!("Could not replace {}: {error}", link.display()))?;
+    }
+    create_dir_link(source, link)
+        .map_err(|error| format!("Could not link {}: {error}", link.display()))
+}
+
+/// Link a custom mod from the Ignore folder into the game instead of copying
+/// it: the game loads the mod's source folder, so edits show up without
+/// another Apply, and removing the link never touches the source.
+#[command]
+pub async fn link_local_mod(
+    app: AppHandle,
+    profile_id: String,
+    local_id: String,
+    mod_name: String,
+    game_path: String,
+) -> Result<serde_json::Value, String> {
+    let dir = local_mod_dir(&app, &profile_id, &local_id)?;
+    let source = read_local_mod_metadata(&dir)
+        .and_then(|metadata| metadata.source_path)
+        .filter(|path| !path.trim().is_empty())
+        .map(std::path::PathBuf::from)
+        .ok_or_else(|| {
+            "This custom mod was not imported from a folder, so there is nothing to link"
+                .to_string()
+        })?;
+    if !source.is_dir() {
+        return Err(format!(
+            "The mod's source folder is gone: {}",
+            source.display()
+        ));
+    }
+
+    let game_identifier = get_profile_game_identifier(&app, &profile_id).unwrap_or_default();
+    let game_root = std::path::Path::new(&game_path);
+    let mods_root = game_mods_root(&app, &profile_id, &game_identifier, game_root)?;
+    let link = mods_root.join(linked_mod_folder_name(
+        &game_identifier,
+        game_root,
+        &mod_name,
+        &source,
+    ));
+    if link.starts_with(&source) || source.starts_with(&link) {
+        return Err("The mod's source folder and the game's mods folder overlap".to_string());
+    }
+    replace_with_dir_link(&source, &link)?;
+
+    // Loaders reconciled by ownership manifests need one for the link, or a
+    // profile switch would leave it behind in the game.
+    let is_balatro = crate::models::shared::is_balatro_identifier(&game_identifier)
+        || is_balatro_game_path(game_root);
+    let is_outerwilds = crate::models::shared::is_outerwilds_identifier(&game_identifier)
+        || crate::models::shared::is_outerwilds_game_path(game_root);
+    if !is_balatro && !is_outerwilds {
+        let (scope, root) =
+            if crate::models::loaders::uses_return_of_modding(&game_identifier, game_root) {
+                (GAME_MANIFEST_SCOPE, game_root.to_path_buf())
+            } else {
+                let bepinex_root = bepinex_install_root(&app, &profile_id, game_root)?;
+                let scope = if bepinex_root != game_root {
+                    PROFILE_MANIFEST_SCOPE
+                } else {
+                    GAME_MANIFEST_SCOPE
+                };
+                (scope, bepinex_root)
+            };
+        let relative = link
+            .strip_prefix(&root)
+            .map_err(|_| format!("{} is outside {}", link.display(), root.display()))?
+            .to_path_buf();
+        save_owned_mod_manifest(&app, &profile_id, scope, &mod_name, &root, &[relative], &[])?;
+    }
+
+    log::info!(
+        "[link_local_mod] Linked {} -> {}",
+        link.display(),
+        source.display()
+    );
+    Ok(serde_json::json!({ "success": true, "linked": link.to_string_lossy() }))
+}
+
 #[command]
 pub async fn delete_local_mod_payload(
     app: AppHandle,
@@ -4659,6 +4807,12 @@ async fn install_mod_bytes(
         if managed_files.is_empty() {
             return Err(format!("{} has no ReturnOfModding payload", mod_name));
         }
+        unlink_before_install(
+            &game_dir
+                .join("ReturnOfModding")
+                .join("plugins")
+                .join(return_of_modding_folder_name(&mod_name)),
+        )?;
         let backed_up_files = backup_existing_mod_files(
             &app,
             &profile_id,
@@ -4817,6 +4971,7 @@ async fn install_mod_bytes(
         ) {
             return Ok(skipped_for_ignored_folder(&mod_name, &folder));
         }
+        unlink_before_install(&mod_dir)?;
         if mod_dir.exists() {
             let _ = fs::remove_dir_all(&mod_dir);
         }
@@ -4958,6 +5113,7 @@ async fn install_mod_bytes(
 
         let target_folder = balatro_target_folder_name(&mod_name);
         let mod_dir = mods_root.join(&target_folder);
+        unlink_before_install(&mod_dir)?;
         let cursor = std::io::Cursor::new(&runtime_bytes);
         let mut archive = zip::ZipArchive::new(cursor).map_err(|e| e.to_string())?;
         extract_zip_directory_to_target(&mut archive, &mod_dir)?;
@@ -5114,6 +5270,19 @@ async fn install_mod_bytes(
             });
             if let Some(folder) = stand_in {
                 return Ok(skipped_for_ignored_folder(&mod_name, &folder));
+            }
+            let mut plugin_folders = managed_files
+                .iter()
+                .filter_map(|file| {
+                    crate::utils::mod_ignore::plugin_folder_of(
+                        &file.to_string_lossy().replace('\\', "/"),
+                    )
+                })
+                .collect::<Vec<_>>();
+            plugin_folders.sort();
+            plugin_folders.dedup();
+            for folder in plugin_folders {
+                unlink_before_install(&bepinex_root.join(folder))?;
             }
         }
         let backed_up_files = if managed_files.is_empty() {
@@ -5371,6 +5540,61 @@ pub async fn remove_mod(
         }
     }
     Ok(false)
+}
+
+/// The folder this profile's game loads mods from: where Apply puts them and
+/// where the Ignore folder's links live.
+fn game_mods_root(
+    app: &AppHandle,
+    profile_id: &str,
+    game_identifier: &str,
+    game_root: &std::path::Path,
+) -> Result<std::path::PathBuf, String> {
+    if crate::models::shared::is_balatro_identifier(game_identifier)
+        || is_balatro_game_path(game_root)
+    {
+        return get_balatro_mods_dir().ok_or_else(|| {
+            "Could not resolve ~/Library/Application Support/Balatro/Mods".to_string()
+        });
+    }
+    if crate::models::shared::is_outerwilds_identifier(game_identifier)
+        || crate::models::shared::is_outerwilds_game_path(game_root)
+    {
+        let owml = crate::models::shared::get_owml_dir(game_root)
+            .unwrap_or_else(|| game_root.join("OWML"));
+        return Ok(owml.join("Mods"));
+    }
+    if crate::models::loaders::uses_return_of_modding(game_identifier, game_root) {
+        return Ok(game_root.join("ReturnOfModding").join("plugins"));
+    }
+    if crate::models::loaders::uses_shimloader(game_identifier) {
+        return Err("Shimloader mods live in the profile, not in a game mods folder".to_string());
+    }
+    let bepinex_root = bepinex_install_root(app, profile_id, game_root)?;
+    let use_disabled_runtime = is_macos_game_dir(game_root) && profile_is_vanilla(app, profile_id);
+    Ok(runtime_plugins_dir(&bepinex_root, use_disabled_runtime))
+}
+
+/// Open the folder the game loads mods from, creating it if Apply has not yet.
+#[command]
+pub async fn open_mods_folder(
+    app: AppHandle,
+    profile_id: String,
+    game_identifier: String,
+    platform: Option<String>,
+) -> Result<(), String> {
+    let game_path = get_game_path(app.clone(), game_identifier.clone(), platform)
+        .await?
+        .ok_or_else(|| "GAME_PATH_NOT_CONFIGURED".to_string())?;
+    let mods_root = game_mods_root(
+        &app,
+        &profile_id,
+        &game_identifier,
+        std::path::Path::new(&game_path),
+    )?;
+    fs::create_dir_all(&mods_root).map_err(|error| error.to_string())?;
+    open::that(&mods_root).map_err(|error| format!("Failed to open mods folder: {error}"))?;
+    Ok(())
 }
 
 #[command]
@@ -10128,6 +10352,106 @@ mod r2mmignore_install_tests {
         assert_eq!(stand_in("Me-Wip-1.0.0"), Some("Me-Wip".to_string()));
         assert_eq!(stand_in("Me-Off-2.0.0"), Some("Me-Off".to_string()));
         assert_eq!(stand_in("Me-New-1.0.0"), None);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn linking_replaces_an_old_link_or_the_mods_own_copy_and_spares_the_source() {
+        use super::replace_with_dir_link;
+        use crate::utils::mod_ignore::is_dir_link;
+        let root = scratch("link-replace");
+        let source = root.join("dev/WipMod");
+        fs::create_dir_all(&source).unwrap();
+        fs::write(source.join("main.lua"), b"wip").unwrap();
+        let other = root.join("dev/Other");
+        fs::create_dir_all(&other).unwrap();
+        let link = root.join("Mods/Me-WipMod-0.1.0");
+
+        // The copy an ordinary install left there goes.
+        fs::create_dir_all(&link).unwrap();
+        fs::write(link.join("main.lua"), b"old copy").unwrap();
+        replace_with_dir_link(&source, &link).unwrap();
+        assert!(is_dir_link(&link));
+        assert_eq!(fs::read(link.join("main.lua")).unwrap(), b"wip");
+
+        // An older link is re-pointed without touching what it pointed at.
+        crate::utils::mod_ignore::remove_dir_link(&link).unwrap();
+        crate::utils::mod_ignore::create_dir_link(&other, &link).unwrap();
+        replace_with_dir_link(&source, &link).unwrap();
+        assert_eq!(fs::read(link.join("main.lua")).unwrap(), b"wip");
+        assert!(other.is_dir());
+        assert_eq!(fs::read(source.join("main.lua")).unwrap(), b"wip");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn linking_refuses_to_replace_a_marked_folder() {
+        use super::replace_with_dir_link;
+        let root = scratch("link-marked");
+        let source = root.join("dev/WipMod");
+        fs::create_dir_all(&source).unwrap();
+        let target = root.join("Mods/Me-WipMod-0.1.0");
+        marked(&target);
+        fs::write(target.join("main.lua"), b"someone's work").unwrap();
+
+        assert!(replace_with_dir_link(&source, &target).is_err());
+        assert_eq!(
+            fs::read(target.join("main.lua")).unwrap(),
+            b"someone's work"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn an_install_takes_the_link_away_instead_of_writing_through_it() {
+        use super::unlink_before_install;
+        let root = scratch("unlink-install");
+        let source = root.join("dev/WipMod");
+        fs::create_dir_all(&source).unwrap();
+        fs::write(source.join("main.lua"), b"wip").unwrap();
+        let link = root.join("Mods/Me-WipMod-0.1.0");
+        crate::utils::mod_ignore::create_dir_link(&source, &link).unwrap();
+
+        unlink_before_install(&link).unwrap();
+        assert!(!link.exists());
+        assert_eq!(fs::read(source.join("main.lua")).unwrap(), b"wip");
+
+        // A real folder is left for the install to handle as before.
+        fs::create_dir_all(&link).unwrap();
+        unlink_before_install(&link).unwrap();
+        assert!(link.is_dir());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_linked_mod_takes_the_folder_name_an_install_would() {
+        use super::linked_mod_folder_name;
+        let root = scratch("link-names");
+        let owml_source = root.join("MyOwmlMod");
+        fs::create_dir_all(&owml_source).unwrap();
+        fs::write(
+            owml_source.join("manifest.json"),
+            br#"{"uniqueName":"Me.MyOwmlMod"}"#,
+        )
+        .unwrap();
+        let plain = std::path::Path::new("/nonexistent-game");
+
+        assert_eq!(
+            linked_mod_folder_name("balatro", plain, "Me-WipMod-0.1.0", &root),
+            "Me-WipMod-0.1.0"
+        );
+        assert_eq!(
+            linked_mod_folder_name("balatro", plain, "Steamopollys-Steamodded-1.0.0", &root),
+            "smods"
+        );
+        assert_eq!(
+            linked_mod_folder_name("outerwilds", plain, "Me-MyOwmlMod-0.1.0", &owml_source),
+            "Me.MyOwmlMod"
+        );
+        assert_eq!(
+            linked_mod_folder_name("lethal-company", plain, "Me-WipMod-0.1.0", &root),
+            "Me-WipMod-0.1.0"
+        );
         fs::remove_dir_all(root).unwrap();
     }
 }

@@ -1,7 +1,37 @@
 import React, { useCallback, useDeferredValue, useEffect, useMemo, useRef, useState } from 'react';
-import { useVirtualizer } from '@tanstack/react-virtual';
+import { createPortal } from 'react-dom';
+import { useVirtualizer, type VirtualItem } from '@tanstack/react-virtual';
 import type { Community, Package } from '../../types/thunderstore';
-import type { Profile, InstalledMod } from '../../types/profile';
+import type { Profile, InstalledMod, ModFolder, ModFolderKind } from '../../types/profile';
+import { AppIcon } from '../ui/icons';
+import {
+    applyLayout,
+    EMPTY_LAYOUT_HISTORY,
+    recordLayoutChange,
+    redoLayout,
+    snapshotLayout,
+    undoLayout,
+    type LayoutHistory,
+} from '../../utils/profileLayoutHistory';
+import {
+    buildSidebarRows,
+    createFolder,
+    folderOf,
+    folderSummary,
+    ignoreFolder,
+    ignoreMode,
+    ignoreMoveNeedsApply,
+    modsChangingIgnore,
+    modsInFolder,
+    moveModsToFolder,
+    placeFolder,
+    reanchorFolders,
+    removeFolder,
+    renameFolder,
+    toggleFolderCollapsed,
+    type FolderDrop,
+    type SidebarRow,
+} from '../../utils/profileModFolders';
 import type { RuntimeHealth } from '../../types/electron';
 import type { ProfileModUpdate } from '../../hooks/useModActions';
 import { Button, DialogLayer, HoverMarquee } from '../ui';
@@ -175,6 +205,19 @@ const getEntryKindInfo = (kind: string) => {
     }
 };
 
+type DragPayload =
+    | { kind: 'mods'; modIds: string[]; label: string; iconUrl?: string; initial: string }
+    | { kind: 'folder'; folderId: string; label: string; folderKind: ModFolderKind };
+type DropTarget =
+    | { kind: 'mods'; folderId: string | null }
+    | { kind: 'place'; drop: FolderDrop };
+
+const dragPayload = (start: DragPayload): DragPayload => (
+    start.kind === 'mods'
+        ? { kind: 'mods', modIds: start.modIds, label: start.label, iconUrl: start.iconUrl, initial: start.initial }
+        : { kind: 'folder', folderId: start.folderId, label: start.label, folderKind: start.folderKind }
+);
+
 interface ProfileSidebarProps {
     activeProfile: Profile | undefined;
     currentCommunity: Community | null;
@@ -187,6 +230,8 @@ interface ProfileSidebarProps {
     onToggleMod: (profileId: string, modUuid: string) => Promise<void> | void;
     onViewModDetails: (pkg: Package) => void;
     onOpenModFolder: (profileId: string, modName: string) => void;
+    /** Open the folder the game loads mods from, where the Ignore folder's links live. */
+    onOpenModsFolder?: (profileId: string) => Promise<void> | void;
     onUninstallMod: (mod: InstalledMod) => Promise<void> | void;
     onInstallToGame: (isVanillaOverride?: boolean) => void;
     confirmBeforeApplyToGame?: boolean;
@@ -229,6 +274,7 @@ export const ProfileSidebar: React.FC<ProfileSidebarProps> = ({
     onToggleMod,
     onViewModDetails,
     onOpenModFolder,
+    onOpenModsFolder,
     onUninstallMod,
     onInstallToGame,
     confirmBeforeApplyToGame = false,
@@ -270,6 +316,24 @@ export const ProfileSidebar: React.FC<ProfileSidebarProps> = ({
         document.addEventListener('mousedown', onPointerDown);
         return () => document.removeEventListener('mousedown', onPointerDown);
     }, [isStatusFilterOpen]);
+    const [isAddMenuOpen, setIsAddMenuOpen] = useState(false);
+    const addMenuRef = useRef<HTMLDivElement>(null);
+    useEffect(() => {
+        if (!isAddMenuOpen) return;
+        const onPointerDown = (event: MouseEvent) => {
+            if (addMenuRef.current && !addMenuRef.current.contains(event.target as Node)) setIsAddMenuOpen(false);
+        };
+        document.addEventListener('mousedown', onPointerDown);
+        return () => document.removeEventListener('mousedown', onPointerDown);
+    }, [isAddMenuOpen]);
+    const [renamingFolderId, setRenamingFolderId] = useState<string | null>(null);
+    const [renameDraft, setRenameDraft] = useState('');
+    const [folderToDelete, setFolderToDelete] = useState<ModFolder | null>(null);
+    // Per profile, for this session: how the sidebar was arranged before each edit.
+    const layoutHistoriesRef = useRef(new Map<string, LayoutHistory>());
+    const [drag, setDrag] = useState<(DragPayload & { x: number; y: number; target: DropTarget | null }) | null>(null);
+    const dragStartRef = useRef<(DragPayload & { x: number; y: number; started: boolean }) | null>(null);
+    const suppressClickRef = useRef(false);
     const searchInputRef = useRef<HTMLInputElement>(null);
     const [isEditing, setIsEditing] = useState(false);
     const [editName, setEditName] = useState('');
@@ -351,6 +415,8 @@ export const ProfileSidebar: React.FC<ProfileSidebarProps> = ({
             // still be older than Thunderstore, so keep them visible in Updates
             // and let staging replace their pending target before the first Sync.
             if (mod.source === 'local') return [];
+            // The Ignore folder freezes a mod as it is in the game.
+            if (ignoreMode(mod, activeProfile.modFolders)) return [];
             const packageName = parsePackageReference(mod.fullName).packageName.toLowerCase();
             const pkg = packageIndex[packageName];
             const latest = pkg ? latestVersionByPackage.get(packageName) : undefined;
@@ -474,7 +540,7 @@ export const ProfileSidebar: React.FC<ProfileSidebarProps> = ({
                 if (matchesProfileModStatus(value, {
                     enabled: mod.enabled,
                     deprecated: !!pkg?.is_deprecated,
-                    outdated: !!pkg && hasNewerVersion(mod.versionNumber, latestVersionNumber(pkg)),
+                    outdated: !!pkg && !ignoreMode(mod, activeProfile?.modFolders) && hasNewerVersion(mod.versionNumber, latestVersionNumber(pkg)),
                 })) counts[value]++;
             }
         }
@@ -491,7 +557,7 @@ export const ProfileSidebar: React.FC<ProfileSidebarProps> = ({
             return matchesProfileModStatus(statusFilter, {
                 enabled: mod.enabled,
                 deprecated: !!pkg?.is_deprecated,
-                outdated: !!pkg && hasNewerVersion(mod.versionNumber, latestVersionNumber(pkg)),
+                outdated: !!pkg && !ignoreMode(mod, activeProfile?.modFolders) && hasNewerVersion(mod.versionNumber, latestVersionNumber(pkg)),
             });
         });
     }, [activeProfile?.mods, searchQuery, statusFilter, packageIndex]);
@@ -501,12 +567,27 @@ export const ProfileSidebar: React.FC<ProfileSidebarProps> = ({
         if (renderedModView === 'sync') return [];
         return searchedMods;
     }, [renderedModView, searchedMods, updateIds]);
+    const modFolders = useMemo(() => activeProfile?.modFolders ?? [], [activeProfile?.modFolders]);
+    // Folders group the All view only; Updates and Sync stay flat lists.
+    const sidebarRows = useMemo<SidebarRow[]>(() => {
+        if (renderedModView !== 'all') return displayedMods.map(mod => ({ type: 'mod' as const, mod, depth: 0 as const }));
+        const filtering = !!searchQuery.trim() || statusFilter !== 'all';
+        return buildSidebarRows(displayedMods, activeProfile?.mods ?? [], modFolders, filtering);
+    }, [activeProfile?.mods, displayedMods, modFolders, renderedModView, searchQuery, statusFilter]);
+    const rowMods = useMemo(
+        () => sidebarRows.flatMap(row => row.type === 'mod' ? [row.mod] : []),
+        [sidebarRows]
+    );
     const modRowVirtualizer = useVirtualizer({
-        count: displayedMods.length,
+        count: sidebarRows.length,
         getScrollElement: () => modListScrollRef.current,
         estimateSize: () => 60,
         overscan: 8,
-        getItemKey: index => displayedMods[index]?.uuid4 ?? index,
+        getItemKey: index => {
+            const row = sidebarRows[index];
+            if (!row) return index;
+            return row.type === 'folder' ? `folder:${row.folder.id}` : row.mod.uuid4;
+        },
     });
     const updateScrollFades = (element: HTMLDivElement | null) => {
         if (!element) return;
@@ -523,8 +604,8 @@ export const ProfileSidebar: React.FC<ProfileSidebarProps> = ({
             window.cancelAnimationFrame(frame);
             resizeObserver.disconnect();
         };
-    }, [activeProfile?.id, displayedMods.length, pendingSyncCount, renderedModView]);
-    const visibleModIds = useMemo(() => new Set(displayedMods.map((m) => m.uuid4)), [displayedMods]);
+    }, [activeProfile?.id, sidebarRows.length, pendingSyncCount, renderedModView]);
+    const visibleModIds = useMemo(() => new Set(rowMods.map((m) => m.uuid4)), [rowMods]);
     const effectiveSelectedModIds = useMemo(
         () => selectedModIds.filter((id) => visibleModIds.has(id)),
         [selectedModIds, visibleModIds]
@@ -623,7 +704,7 @@ export const ProfileSidebar: React.FC<ProfileSidebarProps> = ({
     const handleSelectRow = (e: React.MouseEvent, modId: string) => {
         if (!activeProfile) return;
         const result = resolveDesktopSelection(
-            displayedMods.map(mod => mod.uuid4),
+            rowMods.map(mod => mod.uuid4),
             effectiveSelectedModIds,
             selectionAnchorId,
             modId,
@@ -638,18 +719,19 @@ export const ProfileSidebar: React.FC<ProfileSidebarProps> = ({
         await onToggleMod(activeProfile.id, mod.uuid4);
     };
 
-    const handleBulkDisableSelected = async () => {
-        if (!activeProfile || selectedMods.length === 0) return;
-        const enabledCount = selectedMods.filter((m) => m.enabled).length;
-        const disabledCount = selectedMods.length - enabledCount;
+    /** Disable a group, or enable it when all of it is off; a mixed group flips each mod. */
+    const toggleModsTogether = async (mods: InstalledMod[]) => {
+        if (!activeProfile || mods.length === 0) return;
+        const enabledCount = mods.filter((m) => m.enabled).length;
+        const disabledCount = mods.length - enabledCount;
         const bulkMode: 'disable' | 'enable' | 'toggle' =
             disabledCount === 0 ? 'disable' : enabledCount === 0 ? 'enable' : 'toggle';
 
         const targets = bulkMode === 'disable'
-            ? selectedMods.filter((m) => m.enabled)
+            ? mods.filter((m) => m.enabled)
             : bulkMode === 'enable'
-                ? selectedMods.filter((m) => !m.enabled)
-                : selectedMods;
+                ? mods.filter((m) => !m.enabled)
+                : mods;
 
         if (targets.length === 0) return;
 
@@ -660,6 +742,14 @@ export const ProfileSidebar: React.FC<ProfileSidebarProps> = ({
         );
     };
 
+    const handleBulkDisableSelected = () => toggleModsTogether(selectedMods);
+
+    const uninstallMods = async (mods: InstalledMod[]) => {
+        for (const mod of mods) {
+            await onUninstallMod(mod);
+        }
+    };
+
     const handleBulkDeleteSelected = async () => {
         if (selectedMods.length === 0) return;
         const confirmed = await window.ipcRenderer.confirm(
@@ -667,14 +757,249 @@ export const ProfileSidebar: React.FC<ProfileSidebarProps> = ({
             `Remove ${selectedMods.length} selected mod(s) from this profile?`
         );
         if (!confirmed) return;
-        for (const mod of selectedMods) {
-            await onUninstallMod(mod);
-        }
+        await uninstallMods(selectedMods);
         setSelectedModIds([]);
         setSelectionAnchorId(null);
     };
 
+    /**
+     * Save folder changes. A linked custom mod crossing into or out of the Ignore folder
+     * changes what Apply does with it, so the profile is marked for Apply.
+     */
+    const saveFolders = (mods: InstalledMod[], nextFolders: ModFolder[], ignoreChanged = false, record = true) => {
+        if (!activeProfile) return;
+        // A folder sitting before a mod that just went into a folder moves on to the next loose one.
+        const folders = reanchorFolders(nextFolders, activeProfile.mods, mods);
+        if (record) {
+            const history = layoutHistoriesRef.current.get(activeProfile.id) ?? EMPTY_LAYOUT_HISTORY;
+            layoutHistoriesRef.current.set(
+                activeProfile.id,
+                recordLayoutChange(history, snapshotLayout(activeProfile.mods, modFolders), snapshotLayout(mods, folders)),
+            );
+        }
+        onUpdateProfile(activeProfile.id, {
+            mods,
+            modFolders: folders,
+            ...(ignoreChanged ? { needs_sync: true } : {}),
+        });
+    };
+
+    /** Step the sidebar's arrangement back or forward. Returns whether there was a step. */
+    const stepLayout = (direction: 'undo' | 'redo'): boolean => {
+        if (!activeProfile) return false;
+        const history = layoutHistoriesRef.current.get(activeProfile.id) ?? EMPTY_LAYOUT_HISTORY;
+        const current = snapshotLayout(activeProfile.mods, modFolders);
+        const step = direction === 'undo' ? undoLayout(history, current) : redoLayout(history, current);
+        if (!step.snapshot) return false;
+        layoutHistoriesRef.current.set(activeProfile.id, step.history);
+        const restored = applyLayout(activeProfile.mods, modFolders, step.snapshot);
+        // Crossing the Ignore boundary changes what Apply does, so say so.
+        const inIgnore = (mod: InstalledMod, folders: ModFolder[]) => folderOf(mod, folders)?.kind === 'ignore';
+        const ignoreChanged = restored.mods.some((mod, index) =>
+            ignoreMoveNeedsApply(mod) && inIgnore(mod, restored.folders) !== inIgnore(activeProfile.mods[index], modFolders));
+        setRenamingFolderId(null);
+        saveFolders(restored.mods, restored.folders, ignoreChanged, false);
+        return true;
+    };
+
+    const handleCreateFolder = (kind: ModFolderKind) => {
+        if (!activeProfile) return;
+        setIsAddMenuOpen(false);
+        const id = crypto.randomUUID();
+        const folders = createFolder(modFolders, kind, id);
+        if (folders.length === modFolders.length) return;
+        saveFolders(activeProfile.mods, folders);
+        if (kind === 'normal') {
+            const created = folders.find(folder => folder.id === id);
+            setRenameDraft(created?.name ?? '');
+            setRenamingFolderId(id);
+        }
+    };
+
+    const commitRename = () => {
+        if (!activeProfile || !renamingFolderId) return;
+        saveFolders(activeProfile.mods, renameFolder(modFolders, renamingFolderId, renameDraft));
+        setRenamingFolderId(null);
+    };
+
+    const handleToggleFolder = (folder: ModFolder) => {
+        if (!activeProfile || renamingFolderId === folder.id) return;
+        saveFolders(activeProfile.mods, toggleFolderCollapsed(modFolders, folder.id), false, false);
+    };
+
+    const handleDeleteFolder = async (uninstall: boolean) => {
+        const folder = folderToDelete;
+        setFolderToDelete(null);
+        if (!activeProfile || !folder) return;
+        const inFolder = modsInFolder(activeProfile.mods, modFolders, folder.id);
+        const result = removeFolder(activeProfile.mods, modFolders, folder.id);
+        saveFolders(result.mods, result.folders, folder.kind === 'ignore' && inFolder.some(ignoreMoveNeedsApply));
+        if (uninstall) await uninstallMods(inFolder);
+    };
+
+    const moveModsInto = (modIds: string[], folderId: string | null) => {
+        if (!activeProfile || modIds.length === 0) return;
+        const crossing = modsChangingIgnore(activeProfile.mods, modIds, modFolders, folderId);
+        saveFolders(moveModsToFolder(activeProfile.mods, modIds, folderId), modFolders, crossing.some(ignoreMoveNeedsApply));
+    };
+
+    // Dragging runs on pointer events rather than HTML drag and drop: the
+    // window's native file drop (App.tsx `onDragDropEvent`) swallows HTML drag
+    // events in the webview. A press only becomes a drag after a few pixels,
+    // so a plain click (or a Cmd/Shift click that selects) still works.
+    const handleModPointerDown = (event: React.PointerEvent, mod: InstalledMod, isSelected: boolean) => {
+        if (event.button !== 0 || renderedModView !== 'all') return;
+        const additive = event.shiftKey || event.metaKey || event.ctrlKey;
+        const modIds = isSelected
+            ? (effectiveSelectedModIds.length > 0 ? effectiveSelectedModIds : [mod.uuid4])
+            : additive ? [...effectiveSelectedModIds, mod.uuid4] : [mod.uuid4];
+        const label = modIds.length > 1
+            ? `${modIds.length} mods`
+            : (mod.displayName || mod.fullName.split('-')[1] || mod.fullName);
+        // The ghost shows the cover of the mod under the pointer, even in a group.
+        const name = mod.displayName || mod.fullName.split('-')[1] || mod.fullName;
+        dragStartRef.current = {
+            kind: 'mods',
+            modIds,
+            label,
+            iconUrl: mod.iconUrl,
+            initial: getFirstLetter(name) || '?',
+            x: event.clientX,
+            y: event.clientY,
+            started: false,
+        };
+    };
+
+    const handleFolderPointerDown = (event: React.PointerEvent, folder: ModFolder) => {
+        if (event.button !== 0 || folder.kind === 'ignore' || renamingFolderId === folder.id) return;
+        dragStartRef.current = { kind: 'folder', folderId: folder.id, label: folder.name, folderKind: folder.kind, x: event.clientX, y: event.clientY, started: false };
+    };
+
+    const placeFolderAt = (id: string, drop: FolderDrop) => {
+        if (!activeProfile) return;
+        saveFolders(activeProfile.mods, placeFolder(modFolders, activeProfile.mods, id, drop));
+    };
+    const dropRef = useRef({ moveModsInto, placeFolderAt });
+    useEffect(() => {
+        dropRef.current = { moveModsInto, placeFolderAt };
+    });
+    // The window listeners are added once, but call the handlers of the latest
+    // render: a listener holding the first render's handlers kept old drop
+    // rules alive after a hot reload in development.
+    const dragHandlersRef = useRef<{ move: (event: PointerEvent) => void; up: (event: PointerEvent) => void; cancel: () => void } | null>(null);
+    useEffect(() => {
+        const dropTargetAt = (payload: DragPayload, x: number, y: number): DropTarget | null => {
+            const element = document.elementFromPoint(x, y);
+            if (payload.kind === 'folder') {
+                // Above or below whichever row is under the pointer, by its middle.
+                const half = (row: HTMLElement): 'before' | 'after' => {
+                    const bounds = row.getBoundingClientRect();
+                    return y < bounds.top + bounds.height / 2 ? 'before' : 'after';
+                };
+                const folderRow = element?.closest<HTMLElement>('[data-folder-row]');
+                if (folderRow?.dataset.folderRow) {
+                    if (folderRow.dataset.folderRow === payload.folderId) return null;
+                    return { kind: 'place', drop: { kind: 'folder', folderId: folderRow.dataset.folderRow, position: half(folderRow) } };
+                }
+                const looseRow = element?.closest<HTMLElement>('[data-loose-mod]');
+                if (looseRow?.dataset.looseMod) {
+                    return { kind: 'place', drop: { kind: 'mod', modId: looseRow.dataset.looseMod, position: half(looseRow) } };
+                }
+                // A mod inside a folder stands for the whole folder: drop below it.
+                const nested = element?.closest<HTMLElement>('[data-in-folder]')?.dataset.inFolder;
+                if (nested) {
+                    if (nested === payload.folderId) return null;
+                    return { kind: 'place', drop: { kind: 'folder', folderId: nested, position: 'after' } };
+                }
+                return element?.closest('[data-drop-folder]') ? { kind: 'place', drop: { kind: 'end' } } : null;
+            }
+            // A folder, one of its mods, or the loose list: whichever row is under the pointer.
+            const zone = element?.closest<HTMLElement>('[data-drop-folder]');
+            if (!zone) return null;
+            return { kind: 'mods', folderId: zone.dataset.dropFolder || null };
+        };
+        const finish = () => {
+            if (dragStartRef.current?.started) document.body.style.userSelect = '';
+            dragStartRef.current = null;
+            setDrag(null);
+        };
+        const onPointerMove = (event: PointerEvent) => {
+            const start = dragStartRef.current;
+            if (!start) return;
+            if (!start.started) {
+                if (Math.hypot(event.clientX - start.x, event.clientY - start.y) < 4) return;
+                start.started = true;
+                document.body.style.userSelect = 'none';
+                window.getSelection()?.removeAllRanges();
+            }
+            const payload = dragPayload(start);
+            setDrag({ ...payload, x: event.clientX, y: event.clientY, target: dropTargetAt(payload, event.clientX, event.clientY) });
+            const list = modListScrollRef.current;
+            if (list) {
+                const bounds = list.getBoundingClientRect();
+                if (event.clientY < bounds.top + 36) list.scrollBy({ top: -12 });
+                else if (event.clientY > bounds.bottom - 36) list.scrollBy({ top: 12 });
+            }
+        };
+        const onPointerUp = (event: PointerEvent) => {
+            const start = dragStartRef.current;
+            if (!start?.started) {
+                dragStartRef.current = null;
+                return;
+            }
+            suppressClickRef.current = true;
+            window.setTimeout(() => { suppressClickRef.current = false; }, 0);
+            const payload = dragPayload(start);
+            const target = dropTargetAt(payload, event.clientX, event.clientY);
+            finish();
+            // Dropping outside the list, or on nothing that takes the drag, cancels.
+            if (!target) return;
+            if (payload.kind === 'mods' && target.kind === 'mods') dropRef.current.moveModsInto(payload.modIds, target.folderId);
+            if (payload.kind === 'folder' && target.kind === 'place') dropRef.current.placeFolderAt(payload.folderId, target.drop);
+        };
+        dragHandlersRef.current = { move: onPointerMove, up: onPointerUp, cancel: finish };
+    });
+    useEffect(() => {
+        const move = (event: PointerEvent) => dragHandlersRef.current?.move(event);
+        const up = (event: PointerEvent) => dragHandlersRef.current?.up(event);
+        const cancel = () => dragHandlersRef.current?.cancel();
+        window.addEventListener('pointermove', move);
+        window.addEventListener('pointerup', up);
+        window.addEventListener('pointercancel', cancel);
+        window.addEventListener('blur', cancel);
+        return () => {
+            window.removeEventListener('pointermove', move);
+            window.removeEventListener('pointerup', up);
+            window.removeEventListener('pointercancel', cancel);
+            window.removeEventListener('blur', cancel);
+        };
+    }, []);
+
+    // Cmd+Z / Ctrl+Z undo a folder edit and Shift+Cmd+Z, Ctrl+Shift+Z or Ctrl+Y
+    // redo it — but never while a text field has focus, where they belong to
+    // the text, or while a dialog is open on top of the sidebar.
+    const stepLayoutRef = useRef(stepLayout);
+    useEffect(() => {
+        stepLayoutRef.current = stepLayout;
+    });
+    useEffect(() => {
+        const onKeyDown = (event: KeyboardEvent) => {
+            if (event.defaultPrevented || event.altKey || !(event.metaKey || event.ctrlKey)) return;
+            const key = event.key.toLowerCase();
+            const undo = key === 'z' && !event.shiftKey;
+            const redo = (key === 'z' && event.shiftKey) || (key === 'y' && event.ctrlKey && !event.metaKey && !event.shiftKey);
+            if (!undo && !redo) return;
+            const target = event.target as HTMLElement | null;
+            if (target?.closest('input, textarea, select, [contenteditable=""], [contenteditable="true"]')) return;
+            if (document.querySelector('[role="dialog"][aria-modal="true"]')) return;
+            if (stepLayoutRef.current(undo ? 'undo' : 'redo')) event.preventDefault();
+        };
+        window.addEventListener('keydown', onKeyDown);
+        return () => window.removeEventListener('keydown', onKeyDown);
+    }, []);
+
     const handleModRowClick = (e: React.MouseEvent, mod: InstalledMod, pkg?: Package) => {
+        if (suppressClickRef.current) return;
         if (e.shiftKey || e.metaKey || e.ctrlKey) {
             handleSelectRow(e, mod.uuid4);
             return;
@@ -752,8 +1077,232 @@ export const ProfileSidebar: React.FC<ProfileSidebarProps> = ({
         </div>
     );
 
+    // A folder row reads like a mod row: the same 60px height, icon square,
+    // two lines of text and the same three hover actions, so the list keeps
+    // one rhythm whether a row is a mod or a folder.
+    const renderFolderRow = (row: Extract<SidebarRow, { type: 'folder' }>, virtualRow: VirtualItem) => {
+        const { folder } = row;
+        const renaming = renamingFolderId === folder.id;
+        const isDropTarget = drag?.kind === 'mods' && drag.target?.kind === 'mods' && drag.target.folderId === folder.id;
+        const dropLine = drag?.kind === 'folder' && drag.target?.kind === 'place'
+            && drag.target.drop.kind === 'folder' && drag.target.drop.folderId === folder.id
+            ? (folder.kind === 'ignore' ? 'after' : drag.target.drop.position)
+            : null;
+        const isDraggedFolder = drag?.kind === 'folder' && drag.folderId === folder.id;
+        const allDisabled = row.total > 0 && row.disabled === row.total;
+        const summary = folderSummary(row.total, row.disabled);
+        return (
+            <div
+                key={virtualRow.key}
+                ref={modRowVirtualizer.measureElement}
+                data-index={virtualRow.index}
+                data-drop-folder={folder.id}
+                className="absolute left-0 top-0 w-full pb-1"
+                style={{ transform: `translateY(${virtualRow.start}px)` }}
+            >
+                {dropLine ? (
+                    <span aria-hidden="true" className={`pointer-events-none absolute inset-x-2 z-40 h-0.5 rounded-full bg-blue-500 ${dropLine === 'before' ? '-top-0.5' : 'bottom-0'}`} />
+                ) : null}
+                <div
+                    role="button"
+                    tabIndex={0}
+                    data-folder-row={folder.id}
+                    aria-expanded={row.expanded}
+                    onPointerDown={(event) => handleFolderPointerDown(event, folder)}
+                    onDragStart={(event) => event.preventDefault()}
+                    aria-label={`${folder.name} folder, ${summary}`}
+                    onClick={() => handleToggleFolder(folder)}
+                    onKeyDown={(event) => {
+                        if (renaming || (event.key !== 'Enter' && event.key !== ' ')) return;
+                        event.preventDefault();
+                        handleToggleFolder(folder);
+                    }}
+                    className={`profile-mod-row isolate flex items-center gap-3 rounded-lg border p-2 pr-16 transition-[background-color,border-color,opacity] duration-200 group relative cursor-pointer focus:outline-none focus-visible:ring-1 focus-visible:ring-blue-500 ${isDropTarget
+                        ? 'bg-blue-500/12 border-blue-500/35'
+                        : 'border-transparent hover:border-gray-700 hover:bg-gray-800'} ${isDraggedFolder ? 'opacity-40' : ''}`}
+                >
+                    <div className={`relative z-10 flex h-10 w-10 flex-shrink-0 items-center justify-center rounded-lg border border-gray-700 bg-gray-800 ${folder.kind === 'ignore' ? 'text-fg-accent' : 'text-gray-400'}`}>
+                        <AppIcon name={folder.kind === 'ignore' ? 'folderLink' : 'folder'} className="h-5 w-5" strokeWidth={2} />
+                    </div>
+                    <div className="relative z-10 min-w-0 flex-1">
+                        <div className="flex min-w-0 items-center gap-1.5">
+                            {renaming ? (
+                                <input
+                                    autoFocus
+                                    value={renameDraft}
+                                    onChange={(event) => setRenameDraft(event.target.value)}
+                                    onFocus={(event) => event.currentTarget.select()}
+                                    onClick={(event) => event.stopPropagation()}
+                                    onKeyDown={(event) => {
+                                        event.stopPropagation();
+                                        if (event.key === 'Enter') { event.preventDefault(); commitRename(); }
+                                        if (event.key === 'Escape') { event.preventDefault(); setRenamingFolderId(null); }
+                                    }}
+                                    onBlur={commitRename}
+                                    aria-label="Folder name"
+                                    spellCheck={false}
+                                    className="-my-0.5 min-w-0 flex-1 rounded-md border border-blue-500 bg-gray-900 px-1.5 py-0.5 text-sm font-medium text-white focus:outline-none focus:ring-1 focus:ring-blue-500"
+                                />
+                            ) : (
+                                <>
+                                    <HoverMarquee
+                                        text={folder.name}
+                                        lazy
+                                        className="text-sm font-medium text-gray-200 transition-colors group-hover:text-white"
+                                    />
+                                    <AppIcon
+                                        name="chevron"
+                                        className={`h-3.5 w-3.5 shrink-0 text-gray-500 transition-transform duration-200 ${row.expanded ? 'rotate-90' : ''}`}
+                                        strokeWidth={2}
+                                    />
+                                </>
+                            )}
+                        </div>
+                        <div className="truncate text-xs text-gray-500">{summary}</div>
+                    </div>
+                    {renaming ? null : (
+                        <>
+                            <div aria-hidden="true" className="pointer-events-none absolute inset-y-0 right-0 z-20 w-[48%] transform-gpu rounded-r-lg bg-gradient-to-l from-gray-800 via-gray-800/95 to-transparent opacity-0 transition-opacity duration-200 will-change-[opacity] group-hover:opacity-100" />
+                            <div className="absolute right-2 top-1/2 z-30 flex w-[104px] -translate-y-1/2 transform-gpu items-center justify-between opacity-0 transition-opacity duration-200 will-change-[opacity] group-hover:opacity-100">
+                                <button
+                                    type="button"
+                                    disabled={row.total === 0}
+                                    onClick={(event) => {
+                                        event.stopPropagation();
+                                        if (activeProfile) void toggleModsTogether(modsInFolder(activeProfile.mods, modFolders, folder.id));
+                                    }}
+                                    className={`flex h-8 w-8 shrink-0 items-center justify-center rounded-md transition-colors disabled:opacity-30 ${allDisabled
+                                        ? 'text-yellow-500 bg-yellow-500/10 hover:bg-yellow-500/20'
+                                        : 'text-gray-400 hover:text-fg-warning hover:bg-yellow-400/10'
+                                        }`}
+                                    title={allDisabled ? 'Enable All Mods in Folder' : 'Disable All Mods in Folder'}
+                                >
+                                    <svg xmlns="http://www.w3.org/2000/svg" className="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor" aria-hidden="true">
+                                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M18.364 18.364A9 9 0 005.636 5.636m12.728 12.728A9 9 0 015.636 5.636m12.728 12.728L5.636 5.636" />
+                                    </svg>
+                                </button>
+                                {folder.kind === 'ignore' ? (
+                                    <button
+                                        type="button"
+                                        onClick={(event) => {
+                                            event.stopPropagation();
+                                            if (activeProfile) void onOpenModsFolder?.(activeProfile.id);
+                                        }}
+                                        className="flex h-8 w-8 shrink-0 items-center justify-center rounded-md text-gray-400 transition-colors hover:bg-blue-400/10 hover:text-fg-accent"
+                                        title="Locate in Finder"
+                                    >
+                                        <svg xmlns="http://www.w3.org/2000/svg" className="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor" aria-hidden="true">
+                                            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M3 7v10a2 2 0 002 2h14a2 2 0 002-2V9a2 2 0 00-2-2h-6l-2-2H5a2 2 0 00-2 2z" />
+                                        </svg>
+                                    </button>
+                                ) : (
+                                    <button
+                                        type="button"
+                                        onClick={(event) => {
+                                            event.stopPropagation();
+                                            setRenameDraft(folder.name);
+                                            setRenamingFolderId(folder.id);
+                                        }}
+                                        className="flex h-8 w-8 shrink-0 items-center justify-center rounded-md text-gray-400 transition-colors hover:bg-blue-400/10 hover:text-fg-accent"
+                                        title="Rename Folder"
+                                    >
+                                        <AppIcon name="pencil" className="h-[18px] w-[18px]" strokeWidth={2} />
+                                    </button>
+                                )}
+                                <button
+                                    type="button"
+                                    onClick={(event) => {
+                                        event.stopPropagation();
+                                        setFolderToDelete(folder);
+                                    }}
+                                    className="flex h-8 w-8 shrink-0 items-center justify-center rounded-md text-gray-400 transition-colors hover:bg-red-400/10 hover:text-fg-danger"
+                                    title="Delete Folder"
+                                >
+                                    <svg xmlns="http://www.w3.org/2000/svg" className="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor" aria-hidden="true">
+                                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" />
+                                    </svg>
+                                </button>
+                            </div>
+                        </>
+                    )}
+                </div>
+            </div>
+        );
+    };
+
+    const folderToDeleteCount = folderToDelete && activeProfile
+        ? modsInFolder(activeProfile.mods, modFolders, folderToDelete.id).length
+        : 0;
+
     return (
         <div className="profile-sidebar-surface h-full w-full min-w-0 flex flex-col bg-gray-900 border-r border-gray-800">
+            {folderToDelete ? (
+                <div className="fixed inset-0 z-[80] flex items-center justify-center bg-black/65 p-6 backdrop-blur-sm"
+                    onMouseDown={event => { if (event.target === event.currentTarget) setFolderToDelete(null); }}>
+                    <DialogLayer onDismiss={() => setFolderToDelete(null)} aria-labelledby="folder-delete-title" className="flex w-full max-w-md flex-col overflow-hidden rounded-2xl border border-gray-700 bg-gray-800 shadow-2xl">
+                        <div className="border-b border-gray-700 px-5 py-4">
+                            <h2 id="folder-delete-title" className="text-lg font-bold text-white">Delete “{folderToDelete.name}”?</h2>
+                            <p className="mt-1 text-xs text-gray-400">
+                                {folderToDeleteCount === 0
+                                    ? 'The folder is empty.'
+                                    : `${formatCount(folderToDeleteCount, 'mod')} ${folderToDeleteCount === 1 ? 'is' : 'are'} in this folder. Keep ${folderToDeleteCount === 1 ? 'it' : 'them'} in the profile, or uninstall ${folderToDeleteCount === 1 ? 'it' : 'them'} too.`}
+                            </p>
+                        </div>
+                        <div className={`grid gap-3 p-4 ${folderToDeleteCount === 0 ? 'grid-cols-2' : 'grid-cols-3'}`}>
+                            <button type="button" onClick={() => setFolderToDelete(null)} className="rounded-xl border border-gray-600 bg-gray-700 px-3 py-2.5 text-sm font-semibold text-gray-100">Cancel</button>
+                            <button type="button" data-dialog-primary onClick={() => { void handleDeleteFolder(false); }} className="rounded-xl bg-blue-600 px-3 py-2.5 text-sm font-bold text-on-accent">{folderToDeleteCount === 0 ? 'Delete' : 'Keep mods'}</button>
+                            {folderToDeleteCount > 0 ? (
+                                <button type="button" onClick={() => { void handleDeleteFolder(true); }} className="rounded-xl bg-red-600 px-3 py-2.5 text-sm font-bold text-on-danger">Uninstall</button>
+                            ) : null}
+                        </div>
+                    </DialogLayer>
+                </div>
+            ) : null}
+            {drag ? createPortal(
+                <div
+                    aria-hidden="true"
+                    className="pointer-events-none fixed z-[90] flex max-w-[260px] items-center gap-2.5 rounded-xl border border-blue-500/35 bg-gray-800 py-1.5 pl-1.5 pr-3 text-xs font-medium text-gray-100 shadow-2xl"
+                    style={{ left: drag.x + 14, top: drag.y + 10 }}
+                >
+                    <span className="relative h-8 w-8 shrink-0">
+                        {drag.kind === 'mods' && drag.modIds.length > 1 ? (
+                            <span className="absolute inset-0 translate-x-1 -translate-y-1 rounded-md border border-gray-700 bg-gray-900" />
+                        ) : null}
+                        <span className={`relative flex h-8 w-8 items-center justify-center overflow-hidden rounded-md border border-gray-700 bg-gray-900 ${drag.kind === 'folder' && drag.folderKind === 'ignore' ? 'text-fg-accent' : 'text-gray-400'}`}>
+                            {drag.kind === 'folder' ? (
+                                <AppIcon name={drag.folderKind === 'ignore' ? 'folderLink' : 'folder'} className="h-4 w-4" strokeWidth={2} />
+                            ) : (
+                                <>
+                                    {/* The initial shows through if the cover is missing or fails to load. */}
+                                    <span className="text-[11px] font-bold text-gray-400">{drag.initial}</span>
+                                    {drag.iconUrl ? (
+                                        <img
+                                            src={drag.iconUrl}
+                                            alt=""
+                                            draggable={false}
+                                            onError={(event) => { event.currentTarget.style.display = 'none'; }}
+                                            className="absolute inset-0 h-full w-full object-cover"
+                                        />
+                                    ) : null}
+                                </>
+                            )}
+                        </span>
+                        {drag.kind === 'mods' && drag.modIds.length > 1 ? (
+                            <span className="absolute -bottom-1 -right-1 flex h-4 min-w-4 items-center justify-center rounded-full bg-blue-600 px-1 text-[10px] font-bold leading-none text-on-accent">
+                                {drag.modIds.length}
+                            </span>
+                        ) : null}
+                    </span>
+                    <span className="truncate">{drag.label}</span>
+                    {drag.kind === 'mods' && drag.target?.kind === 'mods' && drag.target.folderId ? (
+                        <span className="flex shrink-0 items-center gap-1 text-fg-accent">
+                            <AppIcon name="chevron" className="h-3 w-3" strokeWidth={2.25} />
+                            <span className="max-w-[110px] truncate">{modFolders.find(folder => drag.target?.kind === 'mods' && folder.id === drag.target.folderId)?.name}</span>
+                        </span>
+                    ) : null}
+                </div>,
+                document.body
+            ) : null}
             {syncConfirmation ? (
                 <div className="fixed inset-0 z-[80] flex items-center justify-center bg-black/65 p-6 backdrop-blur-sm"
                     onMouseDown={event => { if (event.target === event.currentTarget) setSyncConfirmation(null); }}>
@@ -963,17 +1512,47 @@ export const ProfileSidebar: React.FC<ProfileSidebarProps> = ({
                             </div>
                         )}
                     </div>
-                    <button
-                        type="button"
-                        onClick={() => onImportCustomMod?.()}
-                        className="w-[38px] h-[38px] flex-shrink-0 rounded-lg bg-gray-800 border border-gray-700 text-gray-400 hover:text-white hover:border-blue-500 hover:bg-gray-800 focus:outline-none focus:border-blue-500 focus:ring-1 focus:ring-blue-500 transition-colors flex items-center justify-center"
-                        title="Import Custom Mod"
-                        aria-label="Import Custom Mod"
-                    >
-                        <svg xmlns="http://www.w3.org/2000/svg" className="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor" aria-hidden="true">
-                            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 5v14m7-7H5" />
-                        </svg>
-                    </button>
+                    <div className="relative flex-shrink-0" ref={addMenuRef}>
+                        <button
+                            type="button"
+                            onClick={() => setIsAddMenuOpen(open => !open)}
+                            className={`w-[38px] h-[38px] rounded-lg border focus:outline-none focus:ring-1 focus:ring-blue-500 transition-colors flex items-center justify-center ${isAddMenuOpen
+                                ? 'bg-blue-600 border-blue-500 text-on-accent shadow-sm'
+                                : 'bg-gray-800 border-gray-700 text-gray-400 hover:text-white hover:border-blue-500 focus:border-blue-500'}`}
+                            title="Add"
+                            aria-label="Add a folder or a custom mod"
+                            aria-expanded={isAddMenuOpen}
+                            aria-haspopup="menu"
+                        >
+                            <svg xmlns="http://www.w3.org/2000/svg" className="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor" aria-hidden="true">
+                                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 5v14m7-7H5" />
+                            </svg>
+                        </button>
+                        {isAddMenuOpen && (
+                            <div role="menu" className="absolute top-full mt-1.5 right-0 w-56 bg-gray-800 border border-gray-700 rounded-xl shadow-2xl z-50 p-1.5">
+                                {([
+                                    { key: 'folder', icon: 'folderPlus', label: 'Folder', hint: 'Group mods in the sidebar', disabled: !activeProfile, onSelect: () => handleCreateFolder('normal') },
+                                    { key: 'ignore', icon: 'folderLink', label: 'Ignore', hint: ignoreFolder(modFolders) ? 'This profile already has one' : 'Mods Apply leaves alone', disabled: !activeProfile || !!ignoreFolder(modFolders), onSelect: () => handleCreateFolder('ignore') },
+                                    { key: 'custom', icon: 'import', label: 'Import custom mod', hint: 'From a folder or a .zip', disabled: false, onSelect: () => { setIsAddMenuOpen(false); onImportCustomMod?.(); } },
+                                ] as const).map(item => (
+                                    <button
+                                        key={item.key}
+                                        type="button"
+                                        role="menuitem"
+                                        disabled={item.disabled}
+                                        onClick={item.onSelect}
+                                        className="w-full flex items-center gap-3 rounded-lg px-3 py-1.5 text-left text-sm text-gray-300 transition-colors hover:bg-gray-700/60 hover:text-white disabled:pointer-events-none disabled:opacity-40"
+                                    >
+                                        <AppIcon name={item.icon} className="h-4 w-4 shrink-0" strokeWidth={2} />
+                                        <span className="min-w-0 flex-1">
+                                            <span className="block truncate">{item.label}</span>
+                                            <span className="block truncate text-[11px] text-gray-500">{item.hint}</span>
+                                        </span>
+                                    </button>
+                                ))}
+                            </div>
+                        )}
+                    </div>
                 </div>
             </div>
 
@@ -1058,6 +1637,7 @@ export const ProfileSidebar: React.FC<ProfileSidebarProps> = ({
                 <div className="relative min-h-0 flex-1">
                 <div
                     ref={modListScrollRef}
+                    data-drop-folder=""
                     onScroll={event => updateScrollFades(event.currentTarget)}
                     className={`h-full overflow-y-auto p-2 space-y-1 scrollbar-thin scrollbar-thumb-gray-700 scrollbar-track-transparent transition-[filter,opacity] duration-300 ${activeProfile?.is_vanilla ? 'grayscale opacity-75' : ''}`}
                 >
@@ -1227,7 +1807,17 @@ export const ProfileSidebar: React.FC<ProfileSidebarProps> = ({
                         style={{ height: `${modRowVirtualizer.getTotalSize()}px` }}
                     >
                 {modRowVirtualizer.getVirtualItems().map(virtualRow => {
-                    const mod = displayedMods[virtualRow.index];
+                    const row = sidebarRows[virtualRow.index];
+                    if (!row) return null;
+                    if (row.type === 'folder') return renderFolderRow(row, virtualRow);
+                    const mod = row.mod;
+                    const rowIgnoreMode = ignoreMode(mod, modFolders);
+                    const isDragged = drag?.kind === 'mods' && drag.modIds.includes(mod.uuid4);
+                    // Where a dragged folder would land relative to this loose mod.
+                    const modDropLine = row.depth === 0 && drag?.kind === 'folder' && drag.target?.kind === 'place'
+                        && drag.target.drop.kind === 'mod' && drag.target.drop.modId === mod.uuid4
+                        ? drag.target.drop.position
+                        : null;
                     const packageName = parsePackageReference(mod.fullName).packageName.toLowerCase();
                     const pkg = mod.source === 'local' ? undefined : packageIndex[packageName];
                     const latestVersion = pkg ? latestVersionNumber(pkg) : undefined;
@@ -1241,11 +1831,22 @@ export const ProfileSidebar: React.FC<ProfileSidebarProps> = ({
                             key={virtualRow.key}
                             ref={modRowVirtualizer.measureElement}
                             data-index={virtualRow.index}
-                            className="absolute left-0 top-0 w-full pb-1"
+                            data-drop-folder={row.folderId ?? ''}
+                            data-loose-mod={row.depth === 0 ? mod.uuid4 : undefined}
+                            data-in-folder={row.folderId}
+                            className={`absolute left-0 top-0 w-full pb-1 ${row.depth ? 'pl-5' : ''}`}
                             style={{ transform: `translateY(${virtualRow.start}px)` }}
                         >
+                        {row.depth ? (
+                            <span aria-hidden="true" className="pointer-events-none absolute bottom-1 left-2.5 top-0 w-px bg-gray-700/70" />
+                        ) : null}
+                        {modDropLine ? (
+                            <span aria-hidden="true" className={`pointer-events-none absolute inset-x-2 z-40 h-0.5 rounded-full bg-blue-500 ${modDropLine === 'before' ? '-top-0.5' : 'bottom-0'}`} />
+                        ) : null}
                         <div
                             onMouseDown={(event) => { if (event.shiftKey || event.metaKey || event.ctrlKey) event.preventDefault(); }}
+                            onPointerDown={(event) => handleModPointerDown(event, mod, isSelected)}
+                            onDragStart={(event) => event.preventDefault()}
                             aria-selected={isSelected}
                             // No `overflow-hidden`: it was here to keep the two
                             // full-bleed overlays below inside the corner radius,
@@ -1256,7 +1857,7 @@ export const ProfileSidebar: React.FC<ProfileSidebarProps> = ({
                             className={`profile-mod-row isolate flex items-center gap-3 rounded-lg border p-2 pr-16 transition-[background-color,border-color] duration-200 group relative cursor-pointer ${renderedModView === 'updates' ? 'pr-24' : ''} ${isSelected
                                 ? 'bg-blue-500/12 border-blue-500/35'
                                 : 'border-transparent hover:border-gray-700 hover:bg-gray-800'
-                                } ${!mod.enabled ? 'opacity-50' : ''}`}
+                                } ${isDragged ? 'opacity-40' : !mod.enabled ? 'opacity-50' : ''}`}
                             onClick={(e) => handleModRowClick(e, mod, pkg)}
                         >
                             {showDeprecatedWarnings && pkg?.is_deprecated ? (
@@ -1268,7 +1869,7 @@ export const ProfileSidebar: React.FC<ProfileSidebarProps> = ({
                             {/* ... existing mod item content ... */}
                             <div className="relative z-10 w-10 h-10 bg-gray-800 rounded-lg overflow-hidden flex-shrink-0 border border-gray-700">
                                 {mod.iconUrl ? (
-                                    <img src={mod.iconUrl} alt="" className="w-full h-full object-cover" />
+                                    <img src={mod.iconUrl} alt="" draggable={false} className="w-full h-full object-cover" />
                                 ) : (
                                     <div className="w-full h-full flex items-center justify-center text-gray-500 text-xs font-bold">
                                         {mod.source === 'local' ? 'C' : '?'}
@@ -1324,7 +1925,18 @@ export const ProfileSidebar: React.FC<ProfileSidebarProps> = ({
                                             <span className="sr-only">Pending sync</span>
                                         </span>
                                     )}
-                                    {hasUpdate && (
+                                    {rowIgnoreMode && (
+                                        <span
+                                            className="inline-flex flex-shrink-0 items-center text-fg-accent"
+                                            title={rowIgnoreMode === 'linked'
+                                                ? 'Linked to its source folder: edits show up without another Apply'
+                                                : 'Frozen: Apply leaves it exactly as it is in the game'}
+                                        >
+                                            <AppIcon name={rowIgnoreMode === 'linked' ? 'linked' : 'frozen'} className="h-3.5 w-3.5" strokeWidth={2} />
+                                            <span className="sr-only">{rowIgnoreMode === 'linked' ? 'Linked' : 'Frozen'}</span>
+                                        </span>
+                                    )}
+                                    {hasUpdate && !rowIgnoreMode && (
                                         <span
                                             className="inline-flex flex-shrink-0 items-center text-fg-warning"
                                             title={`Update available: v${latestVersion}. Open details to update.`}

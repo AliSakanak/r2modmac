@@ -4,6 +4,7 @@ import type { ProgressSetter } from '../types/progress';
 import { useProfileStore } from '../store/useProfileStore';
 import { findPinnedVersionForSource } from '../utils/modVersioning';
 import { runningOnMacOS } from '../utils/platformUtils';
+import { exportModName, foldersFromImport, ignoreMode } from '../utils/profileModFolders';
 
 const getErrorMessage = (err: unknown, fallback: string) => {
     if (err instanceof Error && err.message) return err.message;
@@ -154,7 +155,14 @@ export function useProfileActions({
                         console.warn('Could not import profile configs:', getErrorMessage(error, 'unknown config import error'));
                     }
                 }
-                updateProfile(newProfileId, { needs_sync: true });
+                const importedProfile = useProfileStore.getState().profiles.find(profile => profile.id === newProfileId);
+                if (importedProfile && Array.isArray(result.folders) && result.folders.length > 0) {
+                    // The Ignore folder pointed at the exporter's disk; it arrives as a normal folder.
+                    const rebuilt = foldersFromImport(result.folders, importedProfile.mods, exportModName, () => crypto.randomUUID());
+                    updateProfile(newProfileId, { mods: rebuilt.mods, modFolders: rebuilt.folders, needs_sync: true });
+                } else {
+                    updateProfile(newProfileId, { needs_sync: true });
+                }
                 setProgressState(prev => ({ ...prev, isOpen: false, progress: 100, currentTask: 'Import complete' }));
                 const totalMods = modsToAdd.length + localMods.length;
                 const message = `Imported profile "${result.name}" with ${installedCount}/${totalMods} mods at their pinned versions.`;
@@ -192,6 +200,23 @@ export function useProfileActions({
     const handleExportFile = async () => {
         if (!activeProfileId) return;
         try {
+            // A custom mod linked from the Ignore folder skips the copy Apply
+            // makes, so take a fresh one of its source for the export.
+            // The export also records each payload's hash, which import checks,
+            // so the refreshed entries are saved before the backend reads them.
+            const profile = useProfileStore.getState().profiles.find(candidate => candidate.id === activeProfileId);
+            const linked = (profile?.mods ?? []).filter(mod => mod.localId && ignoreMode(mod, profile?.modFolders) === 'linked');
+            if (profile && linked.length > 0) {
+                const refreshed = new Map<string, InstalledMod>();
+                for (const mod of linked) {
+                    const result = await window.ipcRenderer.refreshLocalModMetadata(activeProfileId, mod.localId!, mod.sourcePath, mod.enabled);
+                    if (result?.mod) {
+                        refreshed.set(mod.uuid4, { ...mod, ...result.mod, uuid4: mod.uuid4, enabled: mod.enabled, folderId: mod.folderId, pending_sync: mod.pending_sync });
+                    }
+                }
+                updateProfile(activeProfileId, { mods: profile.mods.map(mod => refreshed.get(mod.uuid4) ?? mod) });
+                await window.ipcRenderer.saveProfiles(useProfileStore.getState().profiles);
+            }
             const result = await window.ipcRenderer.exportProfile(activeProfileId);
             if (result.success) alert(`Profile exported to: ${result.path}`);
         } catch (e: any) {

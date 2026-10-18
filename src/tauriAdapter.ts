@@ -91,6 +91,14 @@ export const tauriAPI: IElectronAPI = {
         platforms: options.platforms,
         expectedSha256: options.expectedSha256,
     }),
+    linkLocalMod: async (profileId, localId, modName, gamePath) => {
+        try {
+            await invoke('link_local_mod', { profileId, localId, modName, gamePath });
+            return { success: true };
+        } catch (e) {
+            return { success: false, error: String(e) };
+        }
+    },
     installLocalMod: async (profileId, localId, modName, gamePath, useProfileCache) => {
         try {
             await invoke('install_local_mod', { profileId, localId, modName, gamePath, useProfileCache: useProfileCache ?? false });
@@ -153,6 +161,8 @@ export const tauriAPI: IElectronAPI = {
     shareProfile: async (profileId) => invoke<string>('share_profile', { profileId }),
     openModFolder: async (profileId, modName, gameIdentifier, platform?) =>
         invoke('open_mod_folder', { profileId, modName, gameIdentifier, platform }),
+    openModsFolder: async (profileId, gameIdentifier, platform?) =>
+        invoke('open_mods_folder', { profileId, gameIdentifier, platform }),
     exportProfile: async (profileId) => {
         try {
             return await invoke<any>('export_profile', { profileId });

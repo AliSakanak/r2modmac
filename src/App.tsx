@@ -3362,6 +3362,20 @@ function App() {
             );
           }
         }}
+        onOpenModsFolder={async (profileId) => {
+          try {
+            await window.ipcRenderer.openModsFolder(profileId, selectedCommunity || '', activeProfile?.platform);
+          } catch (e: any) {
+            console.error("Failed to open mods folder:", e);
+            const message = String(e?.message || e || '');
+            await window.ipcRenderer.alert(
+              message.includes('GAME_PATH_NOT_CONFIGURED') ? "Game Path Required" : "Mods Folder Not Found",
+              message.includes('GAME_PATH_NOT_CONFIGURED')
+                ? "Please configure the game directory in Settings, then apply your profile to the game."
+                : `The game's mods folder could not be opened.\n\n${message}`
+            );
+          }
+        }}
         onUninstallMod={async (mod) => {
           if (!activeProfile) return;
           const community = selectedCommunity || activeProfile.gameIdentifier;

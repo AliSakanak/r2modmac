@@ -37,6 +37,45 @@ fn share_profile_endpoint(profile: &serde_json::Value) -> &'static str {
     }
 }
 
+/// A mod's name in an export: `Author-Name`, without the version.
+fn export_mod_name(profile_mod: &serde_json::Value) -> String {
+    let full_name = profile_mod["fullName"].as_str().unwrap_or("");
+    let version_number = profile_mod["versionNumber"].as_str().unwrap_or("0.0.0");
+    full_name
+        .strip_suffix(&format!("-{}", version_number))
+        .unwrap_or(full_name)
+        .to_string()
+}
+
+/// The profile's sidebar folders, by name and kind, listing their mods by
+/// export name. r2modman ignores the key and imports the mods flat.
+fn build_export_folders(profile: &serde_json::Value) -> Vec<serde_json::Value> {
+    let mods = profile["mods"].as_array().map(Vec::as_slice).unwrap_or(&[]);
+    profile["modFolders"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|folder| {
+            let id = folder["id"].as_str()?;
+            let name = folder["name"].as_str()?.trim();
+            if name.is_empty() {
+                return None;
+            }
+            let kind = if folder["kind"].as_str() == Some("ignore") {
+                "ignore"
+            } else {
+                "normal"
+            };
+            let members = mods
+                .iter()
+                .filter(|profile_mod| profile_mod["folderId"].as_str() == Some(id))
+                .map(export_mod_name)
+                .collect::<Vec<_>>();
+            Some(serde_json::json!({ "name": name, "kind": kind, "mods": members }))
+        })
+        .collect()
+}
+
 fn build_export_mods(profile: &serde_json::Value) -> Vec<serde_json::Value> {
     let Some(mods) = profile["mods"].as_array() else {
         return Vec::new();
@@ -253,6 +292,11 @@ fn build_export_data(profile: &serde_json::Value) -> serde_json::Value {
 
     if let Some(plat) = profile.get("platform") {
         export_data["platform"] = plat.clone();
+    }
+
+    let folders = build_export_folders(profile);
+    if !folders.is_empty() {
+        export_data["r2modmacFolders"] = serde_json::json!(folders);
     }
 
     export_data
@@ -758,6 +802,9 @@ fn process_zip_archive(
     if let Some(p) = platform_val {
         result["platform"] = serde_json::json!(p);
     }
+    if let Some(folders) = parsed["r2modmacFolders"].as_array() {
+        result["folders"] = serde_json::json!(folders);
+    }
 
     log::debug!("[process_zip_archive] Final result: {:?}", result);
     Ok(result)
@@ -816,6 +863,42 @@ mod tests {
         (0..archive.len())
             .map(|index| archive.by_index(index).unwrap().name().to_string())
             .collect()
+    }
+
+    #[test]
+    fn folders_travel_in_the_export_and_come_back_on_import() {
+        let profile = serde_json::json!({
+            "name": "Mine",
+            "modFolders": [
+                { "id": "f-ignore", "name": "Ignore", "kind": "ignore" },
+                { "id": "f-qol", "name": "Quality of life", "kind": "normal" },
+                { "id": "f-empty", "name": "  ", "kind": "normal" }
+            ],
+            "mods": [
+                { "fullName": "Author-Suits-1.4.5", "versionNumber": "1.4.5", "enabled": true, "folderId": "f-qol" },
+                { "fullName": "Author-Emotes-1.3.3", "versionNumber": "1.3.3", "enabled": false, "folderId": "f-qol" },
+                { "fullName": "Me-Wip-0.1.0", "versionNumber": "0.1.0", "enabled": true, "folderId": "f-ignore" },
+                { "fullName": "Author-Loose-1.0.0", "versionNumber": "1.0.0", "enabled": true }
+            ]
+        });
+        let export = build_export_data(&profile);
+        assert_eq!(
+            export["r2modmacFolders"],
+            serde_json::json!([
+                { "name": "Ignore", "kind": "ignore", "mods": ["Me-Wip"] },
+                { "name": "Quality of life", "kind": "normal", "mods": ["Author-Suits", "Author-Emotes"] }
+            ])
+        );
+
+        let archive = zip_archive_with_file("export.r2x", &serde_yaml::to_string(&export).unwrap());
+        let imported = process_zip_archive(archive).unwrap();
+        assert_eq!(imported["folders"], export["r2modmacFolders"]);
+    }
+
+    #[test]
+    fn a_profile_without_folders_exports_exactly_as_before() {
+        let export = build_export_data(&serde_json::json!({ "name": "Plain", "mods": [] }));
+        assert!(export.get("r2modmacFolders").is_none());
     }
 
     #[test]

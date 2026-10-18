@@ -39,6 +39,27 @@ export interface InstalledMod {
     pending_sync_status?: PendingSyncStatus;
     pending_sync_error?: string;
     sync_baseline?: InstalledModSnapshot | null;
+    /** The sidebar folder the mod sits in; folders exist only in the sidebar. */
+    folderId?: string;
+}
+
+/**
+ * `normal` folders only group mods in the sidebar. The `ignore` folder also
+ * changes how Apply treats its mods: a custom mod imported from a folder is
+ * linked to that folder, everything else is left exactly as it is in the game.
+ */
+export type ModFolderKind = 'normal' | 'ignore';
+
+export interface ModFolder {
+    id: string;
+    name: string;
+    kind: ModFolderKind;
+    collapsed?: boolean;
+    /**
+     * Where the folder sits among the mods outside any folder: just before
+     * the mod with this uuid4, at the end with `null`, at the top when unset.
+     */
+    anchor?: string | null;
 }
 
 export type InstalledModSnapshot = Omit<InstalledMod,
@@ -75,4 +96,5 @@ export interface Profile {
     launchMode?: ProfileLaunchMode;
     /** Older profiles inherit the setting they were created with. */
     bepinexIsolation?: boolean;
+    modFolders?: ModFolder[];
 }

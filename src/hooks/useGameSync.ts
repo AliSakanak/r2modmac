@@ -6,6 +6,7 @@ import type { ModDownloadProgressEvent, ProfileApplySnapshotProgressEvent, Progr
 import { findPinnedVersionForSource, parsePackageReference } from '../utils/modVersioning';
 import { runningOnWindows } from '../utils/platformUtils';
 import { createFrameScheduler, runWithConcurrency } from '../utils/concurrency';
+import { ignoreMode } from '../utils/profileModFolders';
 import {
     isLoaderPackage,
     isReturnOfModdingCommunity,
@@ -54,7 +55,10 @@ export function useGameSync({
     };
 
     const refreshLocalModsBeforeSync = async (profile: any) => {
-        const localMods = profile.mods.filter((mod: any) => mod.source === 'local' && mod.localId);
+        // A custom mod linked from the Ignore folder is read in place by the
+        // game; there is no copy to refresh.
+        const localMods = profile.mods.filter((mod: any) =>
+            mod.source === 'local' && mod.localId && ignoreMode(mod, profile.modFolders) !== 'linked');
         if (localMods.length === 0) return profile;
 
         let latestProfile = profile;
@@ -412,7 +416,8 @@ export function useGameSync({
                         });
 
                     if (modInProfile) {
-                        if (legacyInstallMode || community === 'outerwilds') {
+                        if ((legacyInstallMode || community === 'outerwilds')
+                            && ignoreMode(modInProfile, profileForLookup.modFolders) !== 'linked') {
                             const cacheResult = await window.ipcRenderer.copyModFromCache(activeProfile.id, modInProfile.fullName, gamePath);
                             if (cacheResult.copied) {
                                 actuallyInstalled++;
@@ -429,6 +434,21 @@ export function useGameSync({
                                 return;
                             }
                             trackedFullName = modInProfile.fullName;
+                            if (ignoreMode(modInProfile, profileForLookup.modFolders) === 'linked') {
+                                const linkResult = await window.ipcRenderer.linkLocalMod(
+                                    activeProfile.id,
+                                    modInProfile.localId,
+                                    modInProfile.fullName,
+                                    gamePath
+                                );
+                                if (!linkResult.success) {
+                                    throw new Error(linkResult.error || 'Linking the custom mod failed');
+                                }
+                                actuallyInstalled++;
+                                status = 'Linked to its source folder';
+                                installedSuccessfully = true;
+                                return;
+                            }
                             const installResult = await window.ipcRenderer.installLocalMod(
                                 activeProfile.id,
                                 modInProfile.localId,

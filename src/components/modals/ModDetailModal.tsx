@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import type { ModSource, PackageVersion, Package } from '../../types/thunderstore';
-import type { InstalledMod } from '../../types/profile';
+import type { InstalledMod, ModFolder } from '../../types/profile';
+import { ignoreMode } from '../../utils/profileModFolders';
 import DOMPurify from 'dompurify';
 import { LikeStat } from '../LikeStat';
 import { firstKnownCount, knownCount, knownSize } from '../../utils/packageStats';
@@ -34,6 +35,8 @@ interface ModDetailModalProps {
     hasUpdate?: boolean;
     gameId: string;
     installedMods?: InstalledMod[];
+    /** The profile's sidebar folders, to tell when the Ignore folder freezes this mod. */
+    modFolders?: ModFolder[];
     isBrowsing?: boolean;
     legacyInstallMode?: boolean;
     showDeprecatedWarning?: boolean;
@@ -157,6 +160,7 @@ export function ModDetailModal({
     hasUpdate = false,
     gameId,
     installedMods = [],
+    modFolders,
     isBrowsing,
     legacyInstallMode = false,
     showDeprecatedWarning = true,
@@ -817,6 +821,16 @@ export function ModDetailModal({
                                     </svg>
                                 </button>
                             )}
+                            {installedMod && !isSelectedInstalled && ignoreMode(installedMod, modFolders) === 'frozen' ? (
+                                <button
+                                    type="button"
+                                    disabled
+                                    className="flex-1 px-4 py-2.5 rounded-lg font-semibold bg-gray-800 text-gray-400 border border-gray-700 cursor-default"
+                                    title="Apply leaves this mod exactly as it is while it sits in the Ignore folder. Move it out to change its version."
+                                >
+                                    Frozen in Ignore folder
+                                </button>
+                            ) : (
                             <button
                                 onClick={() => {
                                     // If the mod is already in profile and user selected a different version,
@@ -844,6 +858,7 @@ export function ModDetailModal({
                                             ? `Update to v${mod.version_number}`
                                             : `${installActionLabel} v${mod.version_number}`}
                             </button>
+                            )}
                         </div>
                     )}
                 </div>

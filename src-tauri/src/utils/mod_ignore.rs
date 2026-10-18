@@ -42,10 +42,65 @@ pub fn ignored_mod_folders(mods_root: &Path) -> Vec<(String, PathBuf)> {
     folders
 }
 
+/// Whether `path` is a link r2modmac made for a mod in the Ignore folder: a
+/// symbolic link, or on Windows a directory junction. Never followed.
+pub fn is_dir_link(path: &Path) -> bool {
+    let Ok(metadata) = fs::symlink_metadata(path) else {
+        return false;
+    };
+    if metadata.file_type().is_symlink() {
+        return true;
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+        return metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0;
+    }
+    #[cfg(not(windows))]
+    false
+}
+
+/// Remove a link without touching the folder it points at.
+pub fn remove_dir_link(path: &Path) -> io::Result<()> {
+    // A Unix symlink goes with remove_file; a Windows junction is a
+    // directory entry and goes with remove_dir, which never recurses.
+    fs::remove_file(path).or_else(|_| fs::remove_dir(path))
+}
+
+/// Link `link` to the folder `source`, so the game reads the source in place.
+pub fn create_dir_link(source: &Path, link: &Path) -> io::Result<()> {
+    if let Some(parent) = link.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink(source, link)
+    }
+    #[cfg(windows)]
+    {
+        // A junction needs no administrator rights or Developer Mode, which a
+        // directory symlink does, and every program reads it as a folder.
+        let status = std::process::Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(link)
+            .arg(source)
+            .status()?;
+        if status.success() {
+            Ok(())
+        } else {
+            Err(io::Error::other(format!(
+                "mklink /J failed for {}",
+                link.display()
+            )))
+        }
+    }
+}
+
 /// The plugin folder a path relative to a BepInEx root belongs to:
 /// `BepInEx/plugins/<folder>`, `BepInEx_DISABLED/plugins/<folder>`, or the
 /// bare `plugins/<folder>` some macOS layouts use.
-fn plugin_folder_of(relative: &str) -> Option<PathBuf> {
+pub fn plugin_folder_of(relative: &str) -> Option<PathBuf> {
     let parts = relative
         .split(['/', '\\'])
         .filter(|part| !part.is_empty())
@@ -82,6 +137,10 @@ pub fn remove_dir_all_keeping_ignored(path: &Path) -> io::Result<bool> {
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
         Err(error) => return Err(error),
     };
+    if metadata.file_type().is_symlink() || is_dir_link(path) {
+        remove_dir_link(path)?;
+        return Ok(false);
+    }
     if !metadata.is_dir() {
         fs::remove_file(path)?;
         return Ok(false);
@@ -195,6 +254,35 @@ mod tests {
             !remove_dir_all_keeping_ignored(&mods).unwrap(),
             "a missing path is not an error"
         );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_link_comes_and_goes_without_touching_its_source() {
+        let root = temp_root("link");
+        let source = root.join("dev/MyMod");
+        fs::create_dir_all(&source).unwrap();
+        fs::write(source.join("main.lua"), b"wip").unwrap();
+        let link = root.join("Mods/MyMod");
+
+        create_dir_link(&source, &link).unwrap();
+        assert!(is_dir_link(&link));
+        assert!(!is_dir_link(&source));
+        assert_eq!(
+            fs::read(link.join("main.lua")).unwrap(),
+            b"wip",
+            "the game reads through the link"
+        );
+        fs::write(source.join("main.lua"), b"edited").unwrap();
+        assert_eq!(
+            fs::read(link.join("main.lua")).unwrap(),
+            b"edited",
+            "edits show up at once"
+        );
+
+        remove_dir_link(&link).unwrap();
+        assert!(!link.exists() && !is_dir_link(&link));
+        assert_eq!(fs::read(source.join("main.lua")).unwrap(), b"edited");
         fs::remove_dir_all(root).unwrap();
     }
 

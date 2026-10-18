@@ -125,6 +125,8 @@ export interface IElectronAPI {
         options: { name?: string; author?: string; version?: string; enabled?: boolean; platforms?: string[]; expectedSha256?: string }
     ) => Promise<{ mod: InstalledMod; inspection: any }>;
     installLocalMod: (profileId: string, localId: string, modName: string, gamePath: string, useProfileCache?: boolean) => Promise<{ success: boolean; error?: string }>;
+    /** Link a custom mod in the Ignore folder to its source folder instead of copying it. */
+    linkLocalMod: (profileId: string, localId: string, modName: string, gamePath: string) => Promise<{ success: boolean; error?: string }>;
     deleteLocalModPayload: (profileId: string, localId: string) => Promise<boolean>;
     checkDirectoryExists: (dirPath: string) => Promise<boolean>;
     fetchCommunities: (refresh?: boolean) => Promise<Community[]>;
@@ -155,6 +157,7 @@ export interface IElectronAPI {
     importProfileConfigs: (profileId: string, archivePath: string) => Promise<number>;
     shareProfile: (profileId: string) => Promise<string>;
     openModFolder: (profileId: string, modName: string, gameIdentifier: string, platform?: 'windows' | 'mac') => Promise<void>;
+    openModsFolder: (profileId: string, gameIdentifier: string, platform?: 'windows' | 'mac') => Promise<void>;
     exportProfile: (profileId: string) => Promise<any>;
     deleteProfileFolder: (profileId: string, gameIdentifier?: string, platform?: 'windows' | 'mac', preserveSharedRuntime?: boolean) => Promise<boolean>;
     /** Resolves false when the source profile has no folder on disk yet. */

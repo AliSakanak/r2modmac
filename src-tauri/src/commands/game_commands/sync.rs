@@ -49,6 +49,42 @@ fn sync_version_suffix(name: &str) -> Option<String> {
     })
 }
 
+/// The profile's Ignore folder, read from the sidebar data in `profiles.json`.
+fn ignore_folder_id(profile: &serde_json::Value) -> Option<&str> {
+    profile["modFolders"]
+        .as_array()?
+        .iter()
+        .find(|folder| folder["kind"].as_str() == Some("ignore"))?["id"]
+        .as_str()
+}
+
+/// Whether a profile mod in the Ignore folder is linked to its source folder:
+/// a custom mod imported from a folder. Every other mod there is frozen.
+pub(crate) fn is_linked_ignore_mod(profile_mod: &serde_json::Value) -> bool {
+    profile_mod["source"].as_str() == Some("local")
+        && profile_mod["sourcePath"]
+            .as_str()
+            .is_some_and(|path| !path.trim().is_empty())
+}
+
+/// `Author-ModName` keys of the mods frozen in the Ignore folder: Apply
+/// leaves them in the game exactly as they are, whatever the profile's
+/// version says, and installs one only when it is missing altogether.
+fn frozen_ignore_keys(profile: &serde_json::Value) -> std::collections::HashSet<String> {
+    let Some(ignore_id) = ignore_folder_id(profile) else {
+        return std::collections::HashSet::new();
+    };
+    profile["mods"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|profile_mod| profile_mod["folderId"].as_str() == Some(ignore_id))
+        .filter(|profile_mod| !is_linked_ignore_mod(profile_mod))
+        .filter_map(|profile_mod| profile_mod["fullName"].as_str())
+        .map(sync_mod_key)
+        .collect()
+}
+
 /// Reconcile Balatro's shared mods folder with a profile, as Apply does.
 ///
 /// Kept apart from `sync_profile_to_game` so it can run against a scratch
@@ -61,6 +97,7 @@ fn sync_balatro_mods(
     desired_key_set: &std::collections::HashSet<String>,
     desired_full_by_key: &std::collections::HashMap<String, String>,
     desired_version_by_key: &std::collections::HashMap<String, String>,
+    frozen_keys: &std::collections::HashSet<String>,
     finalize: bool,
     use_cache: bool,
     needs_config_switch: bool,
@@ -106,6 +143,10 @@ fn sync_balatro_mods(
             to_remove.push(folder_name.clone());
             continue;
         }
+        // Frozen in the Ignore folder: whatever version is in the game stays.
+        if frozen_keys.contains(gm_key) {
+            continue;
+        }
 
         let desired_version = desired_version_by_key.get(gm_key);
         let desired_full = desired_full_by_key.get(gm_key);
@@ -134,6 +175,13 @@ fn sync_balatro_mods(
                 return !lovely_installed;
             }
             if ignored_keys.contains(*pm_key) {
+                return false;
+            }
+            if frozen_keys.contains(*pm_key)
+                && game_mod_folders
+                    .iter()
+                    .any(|(_, gm_key, _)| gm_key == *pm_key)
+            {
                 return false;
             }
 
@@ -192,7 +240,10 @@ fn sync_balatro_mods(
 
         if let Ok(entries) = fs::read_dir(mods_root) {
             for entry in entries.filter_map(|e| e.ok()) {
-                if entry.path().is_dir() && !is_ignored_mod_dir(&entry.path()) {
+                if entry.path().is_dir()
+                    && !entry.path().is_symlink()
+                    && !is_ignored_mod_dir(&entry.path())
+                {
                     let folder_name = entry.file_name().to_string_lossy().to_string();
                     let cache_path = profile_mods_cache.join(&folder_name);
                     if !cache_path.exists() {
@@ -227,6 +278,7 @@ fn sync_outerwilds_mods(
     profile_is_vanilla: bool,
     desired_key_set: &std::collections::HashSet<String>,
     desired_version_by_key: &std::collections::HashMap<String, String>,
+    frozen_keys: &std::collections::HashSet<String>,
     finalize: bool,
     use_cache: bool,
     needs_config_switch: bool,
@@ -337,7 +389,8 @@ fn sync_outerwilds_mods(
 
         // Only check version replacement for mods that are ENABLED (and thus will be
         // re-installed if out of date). Disabled mods stay at whatever version they have.
-        if !desired_key_set.contains(gm_key) {
+        // Mods frozen in the Ignore folder stay at whatever version they have too.
+        if !desired_key_set.contains(gm_key) || frozen_keys.contains(gm_key) {
             continue;
         }
 
@@ -362,6 +415,13 @@ fn sync_outerwilds_mods(
                 return !owml_installed;
             }
             if ignored_keys.contains(*pm_key) {
+                return false;
+            }
+            if frozen_keys.contains(*pm_key)
+                && game_mod_folders
+                    .iter()
+                    .any(|(_, gm_key, _)| gm_key == *pm_key)
+            {
                 return false;
             }
 
@@ -411,7 +471,10 @@ fn sync_outerwilds_mods(
         }
         if let Ok(entries) = fs::read_dir(&owml_mods_dir) {
             for entry in entries.filter_map(|e| e.ok()) {
-                if entry.path().is_dir() && !is_ignored_mod_dir(&entry.path()) {
+                if entry.path().is_dir()
+                    && !entry.path().is_symlink()
+                    && !is_ignored_mod_dir(&entry.path())
+                {
                     let folder_name = entry.file_name().to_string_lossy().to_string();
                     let cache_path = profile_owml_cache.join(&folder_name);
                     if !cache_path.exists() {
@@ -616,6 +679,7 @@ fn plan_plugin_folders(
     desired_key_set: &std::collections::HashSet<String>,
     desired_full_by_key: &std::collections::HashMap<String, String>,
     desired_version_by_key: &std::collections::HashMap<String, String>,
+    frozen_keys: &std::collections::HashSet<String>,
     manifests_to_keep: &[crate::utils::mod_manifest::StoredModOwnershipManifest],
 ) -> PluginFolderPlan {
     let extract_mod_key = sync_mod_key;
@@ -697,6 +761,10 @@ fn plan_plugin_folders(
                 continue;
             }
             to_remove.push(folder_name.clone());
+            continue;
+        }
+        // Frozen in the Ignore folder: whatever version is in the game stays.
+        if frozen_keys.contains(gm_key) {
             continue;
         }
 
@@ -1224,6 +1292,14 @@ pub async fn sync_profile_to_game(
         }
     }
 
+    let frozen_keys = frozen_ignore_keys(profile);
+    if !frozen_keys.is_empty() {
+        log::info!(
+            "[sync_profile_to_game] Leaving {} mod(s) in the Ignore folder as they are",
+            frozen_keys.len()
+        );
+    }
+
     log::debug!(
         "[sync_profile_to_game] Profile has {} mods",
         profile_mod_full_names.len()
@@ -1303,6 +1379,7 @@ pub async fn sync_profile_to_game(
             profile_is_vanilla,
             &desired_key_set,
             &desired_version_by_key,
+            &frozen_keys,
             finalize,
             use_cache,
             needs_config_switch,
@@ -1330,6 +1407,7 @@ pub async fn sync_profile_to_game(
             &desired_key_set,
             &desired_full_by_key,
             &desired_version_by_key,
+            &frozen_keys,
             finalize,
             use_cache,
             needs_config_switch,
@@ -1677,6 +1755,8 @@ pub async fn sync_profile_to_game(
         stored_manifests.into_iter().partition(|entry| {
             let desired_full = desired_full_by_key.get(&entry.manifest.mod_key);
             match desired_full {
+                // Frozen in the Ignore folder: the installed version keeps its files.
+                Some(_) if frozen_keys.contains(&entry.manifest.mod_key) => false,
                 Some(full) => {
                     let dropped = full != &entry.manifest.mod_full_name.to_lowercase();
                     if dropped {
@@ -1714,6 +1794,7 @@ pub async fn sync_profile_to_game(
         &desired_key_set,
         &desired_full_by_key,
         &desired_version_by_key,
+        &frozen_keys,
         &manifests_to_keep,
     );
 
@@ -1764,6 +1845,16 @@ pub async fn sync_profile_to_game(
                 );
             }
             if ignored_keys.contains(*pm_key) {
+                return false;
+            }
+            // Frozen in the Ignore folder: installed once if missing, never replaced.
+            if frozen_keys.contains(*pm_key)
+                && (game_mod_folders.iter().any(|(_, gm_key)| gm_key == *pm_key)
+                    || manifests_to_keep.iter().any(|entry| {
+                        entry.manifest.mod_key == **pm_key
+                            && manifest_files_exist(&bepinex_root, &entry.manifest.files)
+                    }))
+            {
                 return false;
             }
 
@@ -1918,7 +2009,10 @@ pub async fn sync_profile_to_game(
         // Iterate game mods and copy to cache if not present
         if let Ok(entries) = fs::read_dir(&game_plugins) {
             for entry in entries.filter_map(|e| e.ok()) {
-                if entry.path().is_dir() && !is_ignored_mod_dir(&entry.path()) {
+                if entry.path().is_dir()
+                    && !entry.path().is_symlink()
+                    && !is_ignored_mod_dir(&entry.path())
+                {
                     let folder_name = entry.file_name().to_string_lossy().to_string();
                     let cache_path = profile_plugins.join(&folder_name);
 
@@ -2829,6 +2923,16 @@ mod r2mmignore_simulation_tests {
         want: &Desired,
         finalize: bool,
     ) -> serde_json::Value {
+        balatro_apply_frozen(mods_root, cache, want, &HashSet::new(), finalize)
+    }
+
+    fn balatro_apply_frozen(
+        mods_root: &Path,
+        cache: &Path,
+        want: &Desired,
+        frozen: &HashSet<String>,
+        finalize: bool,
+    ) -> serde_json::Value {
         sync_balatro_mods(
             mods_root,
             cache,
@@ -2836,6 +2940,7 @@ mod r2mmignore_simulation_tests {
             &want.keys,
             &want.full,
             &want.version,
+            frozen,
             finalize,
             true,
             false,
@@ -2937,6 +3042,16 @@ mod r2mmignore_simulation_tests {
         mods: &[&str],
         finalize: bool,
     ) -> serde_json::Value {
+        owml_apply_frozen(game, profile_dir, mods, &HashSet::new(), finalize)
+    }
+
+    fn owml_apply_frozen(
+        game: &Path,
+        profile_dir: &Path,
+        mods: &[&str],
+        frozen: &HashSet<String>,
+        finalize: bool,
+    ) -> serde_json::Value {
         let profile = serde_json::json!({
             "mods": mods
                 .iter()
@@ -2951,6 +3066,7 @@ mod r2mmignore_simulation_tests {
             false,
             &want.keys,
             &want.version,
+            frozen,
             finalize,
             true,
             false,
@@ -3001,6 +3117,7 @@ mod r2mmignore_simulation_tests {
             &desired(&[]).keys,
             &HashMap::new(),
             &HashMap::new(),
+            &HashSet::new(),
             &[],
         );
         assert_eq!(plan.to_remove, vec!["Old-Mod-1.0.0".to_string()]);
@@ -3018,11 +3135,193 @@ mod r2mmignore_simulation_tests {
             &wants_release.keys,
             &wants_release.full,
             &wants_release.version,
+            &HashSet::new(),
             &[],
         );
         assert!(plan.ignored_keys.contains("me-wip"));
         assert!(!plan.to_remove.contains(&"Me-Wip".to_string()));
 
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    fn frozen(keys: &[&str]) -> HashSet<String> {
+        keys.iter().map(|key| key.to_string()).collect()
+    }
+
+    #[test]
+    fn frozen_ignore_keys_cover_every_provider_but_linked_custom_mods() {
+        let profile = serde_json::json!({
+            "modFolders": [
+                { "id": "f-ignore", "name": "Ignore", "kind": "ignore" },
+                { "id": "f-tools", "name": "Tools", "kind": "normal" }
+            ],
+            "mods": [
+                { "fullName": "Ts-Mod-1.0.0", "source": "thunderstore", "folderId": "f-ignore" },
+                { "fullName": "Hx-Mod-1.0.0", "source": "hexium", "folderId": "f-ignore" },
+                { "fullName": "Ow-Mod-1.0.0", "source": "outerwilds", "folderId": "f-ignore" },
+                { "fullName": "Me-Zip-1.0.0", "source": "local", "folderId": "f-ignore" },
+                { "fullName": "Me-Dev-0.1.0", "source": "local", "sourcePath": "/dev/Dev", "folderId": "f-ignore" },
+                { "fullName": "Ts-Tool-1.0.0", "folderId": "f-tools" },
+                { "fullName": "Ts-Loose-1.0.0" }
+            ]
+        });
+        assert_eq!(
+            frozen_ignore_keys(&profile),
+            frozen(&["ts-mod", "hx-mod", "ow-mod", "me-zip"])
+        );
+        assert!(frozen_ignore_keys(&serde_json::json!({ "mods": [] })).is_empty());
+    }
+
+    #[test]
+    fn balatro_frozen_mod_keeps_its_version_and_hand_edits() {
+        let root = scratch("balatro-frozen");
+        let mods = root.join("Mods");
+        let cache = root.join("cache");
+        let installed = mod_folder(&mods, "Ts-Mod-1.0.0", "main.lua", b"edited by hand");
+        let wants_newer = desired(&["Ts-Mod-1.1.0"]);
+        let ts_mod = frozen(&["ts-mod"]);
+
+        let plan = balatro_apply_frozen(&mods, &cache, &wants_newer, &ts_mod, false);
+        assert_eq!(plan["to_install"], serde_json::json!([]));
+        assert_eq!(plan["pending_removals"], 0);
+        balatro_apply_frozen(&mods, &cache, &wants_newer, &ts_mod, true);
+        assert_eq!(
+            fs::read(installed.join("main.lua")).unwrap(),
+            b"edited by hand"
+        );
+
+        // Out of the Ignore folder, the same Apply brings it in line.
+        let plan = balatro_apply(&mods, &cache, &wants_newer, false);
+        assert_eq!(plan["to_install"], serde_json::json!(["ts-mod"]));
+        assert_eq!(plan["pending_removals"], 1);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn balatro_frozen_mod_missing_from_the_game_is_installed_once() {
+        let root = scratch("balatro-frozen-missing");
+        let plan = balatro_apply_frozen(
+            &root.join("Mods"),
+            &root.join("cache"),
+            &desired(&["Ts-Mod-1.0.0"]),
+            &frozen(&["ts-mod"]),
+            false,
+        );
+        assert_eq!(plan["to_install"], serde_json::json!(["ts-mod"]));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn owml_frozen_mod_keeps_its_version() {
+        let root = scratch("owml-frozen");
+        let game = root.join("game");
+        let profile_dir = root.join("profile");
+        let installed = owml_mod(&game.join("OWML/Mods"), "Ts.Mod", "Ts.Mod");
+        fs::write(installed.join("Mod.dll"), b"edited by hand").unwrap();
+        let wants = ["Ts-Mod-2.0.0"];
+
+        let plan = owml_apply_frozen(&game, &profile_dir, &wants, &frozen(&["ts-mod"]), false);
+        assert_eq!(plan["to_install"], serde_json::json!([]));
+        assert_eq!(plan["pending_removals"], 0);
+        assert_eq!(
+            fs::read(installed.join("Mod.dll")).unwrap(),
+            b"edited by hand"
+        );
+
+        let plan = owml_apply(&game, &profile_dir, &wants, false);
+        assert_eq!(
+            plan["pending_removals"], 1,
+            "unfrozen, the old version is replaced"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn bepinex_plan_keeps_a_frozen_plugin_at_any_version() {
+        let root = scratch("bepinex-frozen");
+        let plugins = root.join("BepInEx/plugins");
+        mod_folder(&plugins, "Ts-Mod-1.0.0", "Mod.dll", b"edited by hand");
+        let wants_newer = desired(&["Ts-Mod-1.1.0"]);
+        let plan_with = |frozen_keys: &HashSet<String>| {
+            plan_plugin_folders(
+                &plugins,
+                &wants_newer.keys,
+                &wants_newer.full,
+                &wants_newer.version,
+                frozen_keys,
+                &[],
+            )
+        };
+
+        assert!(plan_with(&frozen(&["ts-mod"])).to_remove.is_empty());
+        assert_eq!(
+            plan_with(&HashSet::new()).to_remove,
+            vec!["Ts-Mod-1.0.0".to_string()]
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn balatro_keeps_a_wanted_link_and_unlinks_an_unwanted_one_without_touching_the_source() {
+        let root = scratch("balatro-link");
+        let mods = root.join("Mods");
+        let cache = root.join("profile/Balatro/Mods");
+        let source = mod_folder(&root.join("dev"), "WipMod", "main.lua", b"wip");
+        let link = mods.join("Me-WipMod-0.1.0");
+        crate::utils::mod_ignore::create_dir_link(&source, &link).unwrap();
+
+        // The profile with the linked mod: nothing to install, the link stays,
+        // and the source is not copied into the profile cache.
+        let mine = desired(&["Me-WipMod-0.1.0"]);
+        let plan = balatro_apply(&mods, &cache, &mine, false);
+        assert_eq!(plan["to_install"], serde_json::json!([]));
+        assert_eq!(plan["pending_removals"], 0);
+        balatro_apply(&mods, &cache, &mine, true);
+        assert!(crate::utils::mod_ignore::is_dir_link(&link));
+        assert!(!cache.join("Me-WipMod-0.1.0").exists());
+
+        // Another profile: the link goes, the source stays exactly as it was.
+        balatro_apply(&mods, &cache, &desired(&[]), true);
+        assert!(!link.exists() && !crate::utils::mod_ignore::is_dir_link(&link));
+        assert_eq!(fs::read(source.join("main.lua")).unwrap(), b"wip");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn bepinex_plan_unlinks_an_unwanted_linked_plugin_and_spares_its_source() {
+        let root = scratch("bepinex-link");
+        let plugins = root.join("BepInEx/plugins");
+        let source = mod_folder(&root.join("dev"), "WipPlugin", "Wip.dll", b"wip");
+        let link = plugins.join("Me-WipPlugin-0.1.0");
+        crate::utils::mod_ignore::create_dir_link(&source, &link).unwrap();
+
+        let wanted = desired(&["Me-WipPlugin-0.1.0"]);
+        let plan = plan_plugin_folders(
+            &plugins,
+            &wanted.keys,
+            &wanted.full,
+            &wanted.version,
+            &HashSet::new(),
+            &[],
+        );
+        assert!(plan.to_remove.is_empty());
+        assert!(plan
+            .game_mod_folders
+            .iter()
+            .any(|(_, key)| key == "me-wipplugin"));
+
+        let plan = plan_plugin_folders(
+            &plugins,
+            &HashSet::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashSet::new(),
+            &[],
+        );
+        assert_eq!(plan.to_remove, vec!["Me-WipPlugin-0.1.0".to_string()]);
+        remove_plugin_entry(&link).unwrap();
+        assert!(!link.exists());
+        assert_eq!(fs::read(source.join("Wip.dll")).unwrap(), b"wip");
         fs::remove_dir_all(root).unwrap();
     }
 }

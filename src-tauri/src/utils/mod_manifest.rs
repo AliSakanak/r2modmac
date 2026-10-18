@@ -835,6 +835,29 @@ mod shared_loader_cleanup_tests {
     }
 
     #[test]
+    fn a_linked_plugin_manifest_removes_only_the_link() {
+        let root = world();
+        let source = root.join("dev/WipPlugin");
+        fs::create_dir_all(&source).unwrap();
+        fs::write(source.join("Wip.dll"), b"wip").unwrap();
+        let files = ["BepInEx/plugins/Me-WipPlugin-0.1.0"];
+
+        let link = root.join(files[0]);
+        crate::utils::mod_ignore::create_dir_link(&source, &link).unwrap();
+        cleanup_owned_mod_manifests(&root, &[stored(&root, "Me-WipPlugin", &files)], &[]).unwrap();
+        assert!(!crate::utils::mod_ignore::is_dir_link(&link));
+        assert_eq!(fs::read(source.join("Wip.dll")).unwrap(), b"wip");
+
+        crate::utils::mod_ignore::create_dir_link(&source, &link).unwrap();
+        deactivate_exact_owned_mod_manifests(&root, &[stored(&root, "Me-WipPlugin", &files)], &[])
+            .unwrap();
+        assert!(!crate::utils::mod_ignore::is_dir_link(&link));
+        assert_eq!(fs::read(source.join("Wip.dll")).unwrap(), b"wip");
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn profile_switch_removes_only_outgoing_owned_files() {
         let root = world();
         fs::create_dir_all(root.join("BepInEx/plugins")).unwrap();

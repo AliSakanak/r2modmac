@@ -1,6 +1,7 @@
 import {
     Ban,
     Check,
+    ChevronRight,
     Clock3,
     CircleHelp,
     Copy,
@@ -8,15 +9,20 @@ import {
     EyeOff,
     FileText,
     Folder,
+    FolderPlus,
+    FolderSymlink,
     Gamepad2,
     Heart,
     House,
     Import,
     Keyboard,
     LayoutGrid,
+    Link2,
     List,
+    Lock,
     Palette,
     PanelsTopLeft,
+    Pencil,
     Play,
     Plus,
     RefreshCw,
@@ -67,7 +73,13 @@ export type IconName =
     | 'home'
     | 'list'
     | 'disable'
-    | 'close';
+    | 'close'
+    | 'folderPlus'
+    | 'folderLink'
+    | 'pencil'
+    | 'chevron'
+    | 'linked'
+    | 'frozen';
 
 const ICONS: Record<IconName, LucideIcon> = {
     play: Play,
@@ -100,6 +112,12 @@ const ICONS: Record<IconName, LucideIcon> = {
     list: List,
     disable: Ban,
     close: X,
+    folderPlus: FolderPlus,
+    folderLink: FolderSymlink,
+    pencil: Pencil,
+    chevron: ChevronRight,
+    linked: Link2,
+    frozen: Lock,
 };
 
 export function AppIcon({
