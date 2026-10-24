@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
-# BepInEx 5 only. Lets a BepInEx 5 (Unity Mono) game launched from r2modmac run natively on Apple Silicon instead of under Rosetta.
-# Puts beside the game:
-#   libdoorstop.dylib                       UnityDoorstop 4.5.0, universal (packs often ship only an x86_64 loader)
-#   apple_silicon/AppleSiliconMods.dll, apple_silicon/libjitwrite.dylib   (from build.sh)
+# BepInEx 5 only. Lets a BepInEx 5 (Unity Mono) game launched from r2modmac run natively on Apple Silicon instead of
+# under Rosetta, by hand. r2modmac release builds do this by themselves at launch; this is for builds without it.
+# Puts beside the game, from build.sh's dist/:
+#   libdoorstop.dylib                    UnityDoorstop 4.5.0, universal (packs often ship only an x86_64 loader)
+#   apple_silicon/AppleSiliconMods.dll   apple_silicon/libjitwrite.dylib
 # and clears r2modmac's "use Rosetta" note for the game, so the next launch tries native again.
 # Usage: install.sh <game folder>      install.sh --remove <game folder>   (back to Rosetta)
 set -euo pipefail
@@ -19,7 +20,7 @@ if $remove; then
 fi
 
 [[ "$(uname -m)" == "arm64" ]] || { echo "This Mac isn't Apple Silicon" >&2; exit 1; }
-[[ -f "$HERE/dist/AppleSiliconMods.dll" && -f "$HERE/dist/libjitwrite.dylib" ]] || { echo "Run build.sh first" >&2; exit 1; }
+[[ -f "$HERE/dist/AppleSiliconMods.dll" && -f "$HERE/dist/libjitwrite.dylib" && -f "$HERE/dist/libdoorstop.dylib" ]] || { echo "Run build.sh first" >&2; exit 1; }
 [[ -f "$GAME/BepInEx/core/MonoMod.RuntimeDetour.dll" ]] || echo "Note: no BepInEx/core/MonoMod.RuntimeDetour.dll in $GAME yet (BepInEx 5 is needed; r2modmac installs it with the profile)." >&2
 app="$(find "$GAME" -maxdepth 1 -name '*.app' -print -quit)"
 if [[ -n "$app" ]]; then
@@ -27,16 +28,7 @@ if [[ -n "$app" ]]; then
   lipo -archs "$exe" | grep -q arm64 || { echo "$(basename "$app") has no arm64 build: it can only run under Rosetta" >&2; exit 1; }
 fi
 
-DOORSTOP_VERSION=4.5.0
-DOORSTOP_SHA256=f53e0906b60fdcaab1ed0259420863d0e9183285d2358e2edd9939a47f8c61e8
-tmp="$(mktemp -d)"
-trap 'rm -rf "$tmp"' EXIT
-curl -fsSL -o "$tmp/doorstop.zip" "https://github.com/NeighTools/UnityDoorstop/releases/download/v$DOORSTOP_VERSION/doorstop_macos_release_$DOORSTOP_VERSION.zip"
-echo "$DOORSTOP_SHA256  $tmp/doorstop.zip" | shasum -a 256 -c --quiet
-unzip -q "$tmp/doorstop.zip" -d "$tmp/doorstop"
-lipo -archs "$tmp/doorstop/universal/libdoorstop.dylib" | grep -q arm64
-
-cp "$tmp/doorstop/universal/libdoorstop.dylib" "$GAME/libdoorstop.dylib"
+cp "$HERE/dist/libdoorstop.dylib" "$GAME/libdoorstop.dylib"
 mkdir -p "$GAME/apple_silicon"
 cp "$HERE/dist/AppleSiliconMods.dll" "$HERE/dist/libjitwrite.dylib" "$GAME/apple_silicon/"
 rm -f "$GAME/.r2modmac_force_x64_state"

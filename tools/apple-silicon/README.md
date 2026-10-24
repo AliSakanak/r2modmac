@@ -1,4 +1,4 @@
-# Native Apple Silicon for BepInEx 5 games (experimental, opt-in)
+# Native Apple Silicon for BepInEx 5 games (experimental)
 
 Many Unity games ship a universal (arm64 + x86_64) Mac build, but with BepInEx 5 mods r2modmac falls back to Rosetta.
 This tool lets those games run natively with mods.
@@ -23,10 +23,25 @@ check then pins the game to x64.
 - The launcher (`script_template_prelude.sh`) points Doorstop at `<game>/apple_silicon/AppleSiliconMods.dll` when the
   runtime arch is arm64 and that file exists. Nothing changes for games without it, and the x64 crash fallback still
   applies.
-- `install.sh` adds UnityDoorstop 4.5.0's universal `libdoorstop.dylib` beside the game: packs often ship only
-  `doorstop_libs/libdoorstop_x64.dylib`. The download is pinned by SHA-256.
+- UnityDoorstop 4.5.0's universal `libdoorstop.dylib` goes beside the game (only if the loader there has no arm64):
+  packs often ship only `doorstop_libs/libdoorstop_x64.dylib`. `build.sh` downloads it pinned by SHA-256, with its
+  LGPL-2.1 license.
 
-## Use
+## How it gets to the game
+
+**r2modmac's macOS release builds do it by themselves.** The release build runs `build.sh` and bundles `dist/` into
+the app (`src-tauri/tauri.apple-silicon.conf.json`). Before each modded launch, r2modmac puts the files beside the game
+(`apple_silicon.rs`), but only when all of these hold:
+- the Mac is Apple Silicon;
+- the game has an arm64 build;
+- BepInEx/core has `BepInEx.Preloader.dll` that reads `DOORSTOP_INVOKE_DLL_PATH` (BepInEx 5.4.22 or later);
+- BepInEx/core has `MonoMod.RuntimeDetour.dll`.
+
+It removes an earlier shim if the game's BepInEx changes to one it can't start. It clears a Rosetta pin only the
+first time (that pin came from the crash this fixes). Dev builds (`tauri dev`, plain `tauri build`) don't carry the
+files, so nothing changes there. Anything that goes wrong is logged, and the launch goes on under Rosetta.
+
+## By hand (builds without it)
 
 Needs Xcode's command line tools and the .NET SDK.
 
