@@ -245,6 +245,19 @@ mod bepinex_root_tests {
         assert!(generated.contains("$BASEDIR/doorstop_libs"));
     }
 
+    /// Native arm64 games get an optional shim (beside the game) that lets
+    /// Harmony write code under Apple Silicon's W^X before BepInEx starts.
+    #[test]
+    fn an_apple_silicon_shim_beside_the_game_runs_first_only_on_native_arm64() {
+        let generated = script(BepInExRoot::Game);
+        assert!(generated.contains(r#"apple_silicon_shim="$BASEDIR/apple_silicon/AppleSiliconMods.dll""#));
+        assert!(generated.contains(r#"if [ "$arch" = "arm64" ] && [ -f "$apple_silicon_shim" ]; then"#));
+        assert!(generated.contains(r#"export DOORSTOP_TARGET_ASSEMBLY="$apple_silicon_shim""#));
+        let shim = generated.find("apple_silicon_shim=").unwrap();
+        let arch_chosen = generated.find("selected_runtime_arch=").unwrap();
+        assert!(shim > arch_chosen, "the shim must be chosen after the runtime arch is final");
+    }
+
     #[test]
     fn no_placeholder_survives_into_the_written_script() {
         for generated in [
